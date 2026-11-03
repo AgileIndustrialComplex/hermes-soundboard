@@ -572,8 +572,11 @@ const CSS = `
    The pads shrink slightly once a tenth sound makes the list scroll; that is a
    better trade than a permanent asymmetry. */
 .hermes-sb-grid{display:grid;gap:6px;max-height:min(46vh,300px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-width:thin}
-.hermes-sb-pad{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;height:42px;min-width:0;padding:0 5px;border-radius:5px;background:var(--ui-bg-quaternary);color:var(--ui-text-primary);transition:background-color .1s,box-shadow .1s}
-.hermes-sb-pad:hover{background:var(--chrome-action-hover)}
+/* A pad needs a boundary of its own: the fill delta against the popover is
+   ~1.1:1 and reads as text on a surface rather than seven press targets. An
+   inset hairline (a shadow, not a border — nothing reflows) fixes that. */
+.hermes-sb-pad{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;height:42px;min-width:0;padding:0 5px;border-radius:5px;background:var(--ui-bg-quaternary);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ui-stroke-secondary) 70%,transparent);color:var(--ui-text-primary);transition:background-color .1s,box-shadow .1s}
+.hermes-sb-pad:hover{background:var(--chrome-action-hover);box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary)}
 .hermes-sb-pad:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
 .hermes-sb-pad[data-active=true]{background:color-mix(in srgb,var(--ui-accent) 22%,var(--ui-bg-quaternary));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ui-accent) 70%,transparent)}
 /* A custom pad gets a hairline underscore so "my file" and "built-in tone"
@@ -585,8 +588,8 @@ const CSS = `
 .hermes-sb-pad[data-active=true] .hermes-sb-pad-key{color:var(--ui-accent)}
 /* The trailing "+" tile: the same footprint as a pad so the grid stays even,
    dashed and quieter so it never reads as a sound. */
-.hermes-sb-add{align-items:center;justify-content:center;background:transparent;box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary);color:var(--ui-text-quaternary)}
-.hermes-sb-add:hover{background:var(--chrome-action-hover);box-shadow:inset 0 0 0 1px var(--ui-stroke-primary);color:var(--ui-text-secondary)}
+.hermes-sb-add{align-items:center;justify-content:center;background:transparent;box-shadow:inset 0 0 0 1px var(--ui-stroke-tertiary);color:var(--ui-text-tertiary)}
+.hermes-sb-add:hover{background:var(--chrome-action-hover);box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary);color:var(--ui-text-primary)}
 .hermes-sb-add:disabled{opacity:.5;cursor:default}
 .hermes-sb-empty{padding:18px 8px;text-align:center;font-size:11px;line-height:16px;color:var(--ui-text-tertiary)}
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
