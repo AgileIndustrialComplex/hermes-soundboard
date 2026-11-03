@@ -58,7 +58,7 @@ mode all persist per machine.
 
 ## Triggers
 
-A binding is `pad → trigger`. The dropdown is grouped, and each entry maps to one
+A binding is `pad → trigger`. The picker is grouped, and each entry maps to one
 real gateway event with a filter, so a pad reacts to "the turn finished
 successfully", not "every `message.complete` frame".
 
@@ -88,6 +88,15 @@ plugin deliberately exposes the 14 that are worth interrupting a human for. The
 full set is the generated `GATEWAY_EVENT_TYPES` in
 `apps/shared/src/gateway-contract.generated.ts`.
 
+**Why the picker is not a `<select>`.** It was one, and the list came up as a
+near-white sheet under this theme's cream text — roughly 1.1:1, unreadable. A
+native option list is not a DOM node: the browser draws it from the page's
+`color-scheme`, so no page CSS can restyle it. The picker is now a button plus
+an in-DOM list, which means every pixel of the menu is ours, it inherits the
+theme, it escapes the manage list's scroll container (`position: fixed`), and it
+can be measured and screenshotted by the test suite — the menu asserts at
+**8.12:1** for its rows and **4.80:1** for group headers.
+
 **On autoplay.** A triggered sound plays while the window may be unfocused, so
 the WebAudio context can be suspended by the browser's autoplay policy. Every
 trigger attempts a resume; if the platform refuses, the pad still lights up, so
@@ -97,12 +106,14 @@ the cue is never silently lost.
 
 ![The soundboard popover](shots/preview-panel.png)
 
+![The trigger picker open](shots/preview-menu.png)
+
 | | |
 |---|---|
 | ![Manage mode](shots/preview-manage.png) | ![Settings page](shots/preview-settings.png) |
 | Manage mode — rename, preview, delete | Settings → Plugins → Soundboard |
 
-All three are produced by `npm run test:ui`, not by hand.
+All of these are produced by `npm run test:ui`, not by hand.
 
 ## Install
 

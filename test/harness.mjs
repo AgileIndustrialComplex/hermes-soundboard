@@ -538,43 +538,61 @@ check('leaving manage mode shows the pad grid again', () => {
 // ── triggers ────────────────────────────────────────────────────────────
 // Every pad carries a "play when" select; a bound pad fires on its gateway
 // event and stays silent for every other one.
-const selectFor = name => [...(panel()?.querySelectorAll('.hermes-sb-select') ?? [])].find(select =>
-  (select.getAttribute('aria-label') ?? '').endsWith(name)
+const pickerFor = name => [...(panel()?.querySelectorAll('.hermes-sb-picker') ?? [])].find(picker =>
+  (picker.getAttribute('aria-label') ?? '').endsWith(name)
 )
-const setSelect = (select, value) => {
-  act(() => {
-    select.value = value
-    select.dispatchEvent(new window.Event('change', { bubbles: true }))
-  })
+const rowFor = name => rows().find(row => row.querySelector('.hermes-sb-row-name')?.value === name)
+/** Open a row's trigger menu, click the named trigger, and let React settle. */
+const bindVia = (name, triggerLabel) => {
+  click(pickerFor(name))
+  const menu = panel().querySelector('.hermes-sb-menu')
+  if (!menu) throw new Error('the trigger menu did not open')
+  const row = [...menu.querySelectorAll('.hermes-sb-menu-row')].find(item => item.textContent.trim() === triggerLabel)
+  if (!row) throw new Error(`no "${triggerLabel}" row in the menu`)
+  click(row)
 }
 
 click(iconButton('Manage sounds'))
-check('every manage row offers a trigger select', () => {
-  const selects = panel().querySelectorAll('.hermes-sb-select')
-  if (selects.length !== rows().length) throw new Error(`${selects.length} selects for ${rows().length} rows`)
-  const options = selects[0].querySelectorAll('option')
-  if (options.length < 10) throw new Error(`only ${options.length} options`)
-  if (options[0].value !== '') throw new Error('the first option must be "never"')
+check('every manage row offers a trigger picker', () => {
+  const pickers = panel().querySelectorAll('.hermes-sb-picker')
+  if (pickers.length !== rows().length) throw new Error(`${pickers.length} pickers for ${rows().length} rows`)
 })
-check('trigger options are grouped', () => {
-  const groups = panel().querySelectorAll('.hermes-sb-select optgroup')
-  if (groups.length < 3) throw new Error(`only ${groups.length} groups`)
+check('the picker renders its list in the DOM, not as a native select', () => {
+  if (panel().querySelector('select')) throw new Error('a native <select> is still rendered')
+  click(pickerFor('Pop'))
+  const menu = panel().querySelector('.hermes-sb-menu')
+  if (!menu) throw new Error('no in-DOM menu')
+  const rowsInMenu = menu.querySelectorAll('.hermes-sb-menu-row')
+  if (rowsInMenu.length < 15) throw new Error(`only ${rowsInMenu.length} rows`)
+  const groups = menu.querySelectorAll('.hermes-sb-menu-group')
+  if (groups.length < 4) throw new Error(`only ${groups.length} groups`)
+  click(pickerFor('Pop'))
+})
+check('the menu is opaque — it carries its own background, not the page behind it', () => {
+  click(pickerFor('Pop'))
+  const menu = panel().querySelector('.hermes-sb-menu')
+  const style = window.getComputedStyle(menu)
+  if (!style.backgroundColor || style.backgroundColor === 'rgba(0, 0, 0, 0)') {
+    throw new Error(`menu background is ${style.backgroundColor}`)
+  }
+  const rowStyle = window.getComputedStyle(menu.querySelector('.hermes-sb-menu-row'))
+  if (!rowStyle.color) throw new Error('menu rows have no colour')
+  click(pickerFor('Pop'))
 })
 
-const popSelect = selectFor('Pop')
-setSelect(popSelect, 'attention.approval')
+bindVia('Pop', 'Approval needed')
 check('binding a trigger persists on the sound', () => {
   const saved = JSON.parse(storage.get('sounds'))
   const pop = saved.find(sound => sound.name === 'Pop')
   if (pop.trigger !== 'attention.approval') throw new Error(`trigger=${pop.trigger}`)
 })
 check('a bound row is marked', () => {
-  const row = rows().find(item => item.querySelector('.hermes-sb-select')?.value === 'attention.approval')
-  if (!row || row.getAttribute('data-bound') !== 'true') throw new Error('row not marked bound')
+  const picker = pickerFor('Pop')
+  if (picker?.getAttribute('data-bound') !== 'true') throw new Error('picker not marked bound')
+  if (picker.textContent.trim() !== 'Approval needed') throw new Error(`label is "${picker.textContent.trim()}"`)
 })
 
-const dingSelect = selectFor('Ding')
-setSelect(dingSelect, 'turn.complete')
+bindVia('Ding', 'Turn finishes')
 click(iconButton('Done'))
 check('a bound pad shows a dot in the grid', () => {
   const bound = [...panel().querySelectorAll('.hermes-sb-pad')].filter(pad => pad.getAttribute('data-bound') === 'true')
@@ -621,7 +639,7 @@ check('the readout clears when a trigger fired nothing', () => {
 
 // Unbinding returns the pad to click-only.
 click(iconButton('Manage sounds'))
-setSelect(selectFor('Ding'), '')
+bindVia('Ding', 'Never')
 check('choosing "never" clears the binding', () => {
   const saved = JSON.parse(storage.get('sounds'))
   const ding = saved.find(sound => sound.name === 'Ding')

@@ -161,7 +161,7 @@ fs.writeFileSync(
   `<!doctype html>
 <html><head><meta charset="utf-8"><style>${THEME}</style></head>
 <body><div id="stage">
-  <div class="fake-editor">Hermes Desktop — status bar preview</div>
+  <div class="fake-editor" style="pointer-events:none">Hermes Desktop — status bar preview</div>
   <div id="settings-host" hidden></div>
   <div class="fake-statusbar">
     <span class="fake-item">VOX FM 128</span>
@@ -318,53 +318,72 @@ await shot('preview-manage.png')
 console.log(`manage rows: ${await page.$$eval('.hermes-sb-row', nodes => nodes.length)}`)
 
 // ── triggers, measured in a real browser ────────────────────────────────
-const selects = await page.$$eval('.hermes-sb-select', nodes =>
+// The picker is an in-DOM button + menu, so unlike a native <select> its list
+// CAN be measured and screenshotted. That is the whole reason it exists.
+const pickers = await page.$$eval('.hermes-sb-picker', nodes =>
   nodes.map(node => ({
     label: node.getAttribute('aria-label'),
-    options: [...node.options].map(option => ({ value: option.value, label: option.text })),
-    groups: [...node.querySelectorAll('optgroup')].map(group => group.label),
-    width: Math.round(node.getBoundingClientRect().width)
-  }))
-)
-console.log(`trigger selects: ${selects.length}`)
-if (selects.length) {
-  const first = selects[0]
-  console.log(`  groups: ${first.groups.join(' / ')}`)
-  console.log(`  options: ${first.options.length} (${first.options.slice(0, 3).map(o => o.label).join(', ')}…)`)
-  console.log(`  select width: ${first.width}px`)
-  if (first.options.length < 10) console.log('!! too few trigger options')
-  if (first.groups.length < 3) console.log('!! trigger options are not grouped')
-  // A select must fit inside a manage row without pushing the name field out.
-  const rowFit = await page.$eval('.hermes-sb-row', row => {
-    const name = row.querySelector('.hermes-sb-row-name')
-    const select = row.querySelector('.hermes-sb-select')
-    const buttons = [...row.querySelectorAll('.hermes-sb-rowbtn')]
-    const box = node => {
+    text: node.textContent.trim(),
+    expanded: node.getAttribute('aria-expanded'),
+    box: (() => {
       const r = node.getBoundingClientRect()
       return { w: Math.round(r.width), h: Math.round(r.height), y: Math.round(r.y) }
-    }
-    return {
-      row: Math.round(row.getBoundingClientRect().width),
-      name: box(name),
-      select: box(select),
-      buttons: buttons.map(box)
-    }
-  })
-  console.log(`  row ${rowFit.row}px`)
-  console.log(`  name field ${rowFit.name.w}x${rowFit.name.h} @y${rowFit.name.y}`)
-  console.log(`  select     ${rowFit.select.w}x${rowFit.select.h} @y${rowFit.select.y}`)
-  console.log(`  buttons    ${rowFit.buttons.map(b => `${b.w}x${b.h}`).join(' ')}`)
-  if (rowFit.name.w < 88) console.log('!! the name field is crushed by the select')
-  // Row controls must share one height and one baseline, or the row reads as
-  // three different components stacked by accident.
-  const heights = new Set([rowFit.name.h, rowFit.select.h])
-  if (heights.size > 1) console.log(`!! control heights disagree: ${[...heights].join(' vs ')}`)
-  if (Math.abs(rowFit.name.y - rowFit.select.y) > 1) console.log(`!! baselines disagree: y${rowFit.name.y} vs y${rowFit.select.y}`)
-}
+    })()
+  }))
+)
+console.log(`trigger pickers: ${pickers.length}`)
+if (pickers.length) console.log(`  first: "${pickers[0].text}" ${pickers[0].box.w}x${pickers[0].box.h} @y${pickers[0].box.y}`)
 
-// Bind a sound, fire the event, and confirm the pad lights up + the readout.
-const popSelect = page.locator('.hermes-sb-select').first()
-await popSelect.selectOption('attention.approval')
+// Open the first picker and measure the LIST itself.
+await page.click('.hermes-sb-picker')
+await page.waitForSelector('.hermes-sb-menu', { timeout: 3000 })
+const menu = await page.evaluate(() => {
+  const node = document.querySelector('.hermes-sb-menu')
+  const row = node.querySelector('.hermes-sb-menu-row')
+  const heading = node.querySelector('.hermes-sb-menu-heading')
+  const style = getComputedStyle(node)
+  const rowStyle = getComputedStyle(row)
+  const headingStyle = getComputedStyle(heading)
+  const r = node.getBoundingClientRect()
+  return {
+    rows: node.querySelectorAll('.hermes-sb-menu-row').length,
+    groups: node.querySelectorAll('.hermes-sb-menu-group').length,
+    background: style.backgroundColor,
+    border: style.borderColor,
+    box: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+    row: { color: rowStyle.color, background: rowStyle.backgroundColor },
+    heading: { color: headingStyle.color, background: headingStyle.backgroundColor }
+  }
+})
+const luminance = css => {
+  const parts = css.match(/[\d.]+/g)
+  if (!parts || parts.length < 3) return null
+  const [r, g, b] = parts.slice(0, 3).map(Number).map(v => {
+    const c = v / 255
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
+  })
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+const contrastOn = (fg, bg) => {
+  const [a, b] = [luminance(fg), luminance(bg)].sort((x, y) => y - x)
+  return a == null || b == null ? null : (a + 0.05) / (b + 0.05)
+}
+const menuRatio = contrastOn(menu.row.color, menu.background)
+const headingRatio = contrastOn(menu.heading.color, menu.background)
+console.log(`  menu bg ${menu.background} (${menu.box.w}x${menu.box.h} @ ${menu.box.x},${menu.box.y})`)
+console.log(`  ${menu.rows} rows in ${menu.groups} groups`)
+console.log(`  row text ${menu.row.color} → ${menuRatio?.toFixed(2)}:1 on the menu surface`)
+console.log(`  group label ${menu.heading.color} → ${headingRatio?.toFixed(2)}:1`)
+if (!/^rgb/.test(menu.background) || menu.background.includes('rgba(0, 0, 0, 0)')) console.log('!! the menu has no opaque background')
+if (menuRatio !== null && menuRatio < 4.5) console.log(`!! menu row text fails 4.5:1 (${menuRatio.toFixed(2)})`)
+if (headingRatio !== null && headingRatio < 3) console.log(`!! group label fails 3:1 (${headingRatio.toFixed(2)})`)
+if (menu.rows < 15) console.log(`!! only ${menu.rows} trigger rows`)
+if (menu.box.y + menu.box.h > 560) console.log('!! the menu runs off the bottom of the viewport')
+await shot('preview-menu.png')
+
+// Pick one from the open menu.
+await page.click('.hermes-sb-menu-row:has-text("Approval needed")')
+await page.waitForTimeout(200)
 await page.click('.hermes-sb-panel button[aria-label="Done"]')
 await page.waitForTimeout(200)
 const boundPads = await page.$$eval('.hermes-sb-pad[data-bound="true"]', nodes => nodes.length)

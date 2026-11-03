@@ -796,24 +796,43 @@ const CSS = `
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
 .hermes-sb-row{display:flex;align-items:center;gap:4px}
 .hermes-sb-row .hermes-sb-row-name{flex:1;min-width:0;font-size:11px}
-/* The trigger select is the widest content in a manage row (longest label is
-   "Risky tool output"), so it gets the larger share and the name field shrinks
-   to roughly 12 characters — enough for a pad name, no more.
-   Height and box-sizing are pinned to the row's other controls (the 22px
-   buttons, the 21px name field) so all four share one baseline; the native
-   select's own metrics otherwise leave it 5px shorter and 3px lower. */
-.hermes-sb-when{flex:0 0 124px;min-width:0;display:flex;align-items:center;height:22px}
-.hermes-sb-select{width:100%;height:21px;box-sizing:border-box;margin:0;font:inherit;font-size:10px;line-height:15px;
-  padding:1px 15px 1px 4px;border-radius:3px;
-  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
-  border:1px solid var(--ui-stroke-secondary);outline:none;
-  appearance:none;-webkit-appearance:none;text-overflow:ellipsis;
-  background-image:linear-gradient(45deg,transparent 50%,var(--ui-text-quaternary) 50%),linear-gradient(135deg,var(--ui-text-quaternary) 50%,transparent 50%);
-  background-position:calc(100% - 9px) 55%,calc(100% - 5px) 55%;
-  background-size:4px 4px,4px 4px;background-repeat:no-repeat}
-.hermes-sb-select:hover{border-color:var(--ui-stroke-primary)}
-.hermes-sb-select:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
-.hermes-sb-row[data-bound=true] .hermes-sb-select{color:var(--ui-accent);border-color:color-mix(in srgb,var(--ui-accent) 45%,var(--ui-stroke-secondary))}
+/* The trigger picker is a button + an in-DOM menu, NOT a native <select>.
+   A native option list is a browser-drawn popup coloured from the page's
+   color-scheme property; inside this popover it came up as a near-white sheet
+   under cream text (~1.1:1) and no page CSS could reach it. Owning the list
+   means owning its background — the menu paints on --ui-bg-elevated with
+   primary text, and the panel's own popover is opaque enough to sit behind it. */
+.hermes-sb-when{flex:0 0 124px;min-width:0;display:flex;align-items:center;height:22px;position:relative}
+.hermes-sb-picker{width:100%;height:21px;box-sizing:border-box;margin:0;display:flex;align-items:center;gap:2px;
+  padding:0 4px;border-radius:3px;text-align:left;
+  font-size:10px;line-height:13px;color:var(--ui-text-secondary);
+  background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary);outline:none}
+.hermes-sb-picker:hover{border-color:var(--ui-stroke-primary);color:var(--ui-text-primary)}
+.hermes-sb-picker:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
+.hermes-sb-picker[data-open=true]{border-color:var(--ui-accent);color:var(--ui-text-primary)}
+.hermes-sb-picker[data-bound=true]{color:var(--ui-accent);border-color:color-mix(in srgb,var(--ui-accent) 45%,var(--ui-stroke-secondary))}
+.hermes-sb-picker-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-sb-picker-caret{flex-shrink:0;width:0;height:0;margin-top:1px;
+  border-left:3px solid transparent;border-right:3px solid transparent;border-top:4px solid var(--ui-text-tertiary)}
+.hermes-sb-picker[data-open=true] .hermes-sb-picker-caret{transform:rotate(180deg)}
+/* Opaque, themed, and layered above the row it belongs to. max-height keeps a
+   14-row grouped list inside a popover that is already near the viewport top. */
+.hermes-sb-menu{position:fixed;z-index:20;width:186px;
+  max-height:238px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;
+  padding:3px;border-radius:5px;
+  background-color:var(--ui-bg-elevated);border:1px solid var(--ui-stroke-secondary);
+  box-shadow:0 10px 26px rgba(0,0,0,.55)}
+/* Fixed positioning to escape the manage list's own scroll container; the
+   upward variant is anchored by its bottom edge, 2px above the trigger. */
+.hermes-sb-menu[data-drop=up]{transform:translateY(-100%)}
+.hermes-sb-menu-group{display:flex;flex-direction:column}
+.hermes-sb-menu-heading{padding:5px 6px 2px;font-size:9px;line-height:11px;font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-tertiary);background-color:var(--ui-bg-elevated)}
+.hermes-sb-menu-row{display:block;width:100%;padding:3px 6px;border-radius:3px;text-align:left;
+  font-size:11px;line-height:15px;color:var(--ui-text-primary);background-color:transparent}
+.hermes-sb-menu-row:hover,.hermes-sb-menu-row[data-cursor=true]{background-color:var(--chrome-action-hover)}
+.hermes-sb-menu-row[data-selected=true]{color:var(--ui-accent);font-weight:600}
+.hermes-sb-menu-row[data-selected=true]::after{content:"✓";float:right;font-weight:400}
 .hermes-sb-rowbtn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex-shrink:0;border-radius:4px;color:var(--ui-text-tertiary)}
 .hermes-sb-rowbtn:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
 .hermes-sb-rowbtn[data-destructive=true]{color:var(--ui-text-secondary)}
@@ -861,38 +880,171 @@ function Pad({ sound, index, engine }) {
   }, sound.id)
 }
 
+/** A trigger picker rendered INSIDE the popover's own DOM.
+ *
+ * A native <select> was the obvious choice and the wrong one: its option list
+ * is not a DOM node, it is a popup the browser draws from the page's
+ * `color-scheme`, and inside the Desktop's nested popover it came up as a
+ * near-white sheet under cream text — unreadable, and no CSS of ours could
+ * reach it. This is a plain button + list, so every pixel is ours, it inherits
+ * the theme, and it can be asserted in a screenshot.
+ *
+ * Keyboard: Enter/Space opens, arrows move, Enter picks, Escape closes —
+ * handled on the trigger so it does not steal the panel's own key downs.
+ */
 function TriggerSelect({ sound, engine }) {
   const t = usePluginI18n(ID)
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState(null)
+  const [cursor, setCursor] = useState(-1)
+  const boxRef = useRef(null)
+  const current = sound.trigger ? TRIGGER_BY_ID.get(sound.trigger) : null
 
-  // A native <select> on purpose: 14 grouped options, keyboard-operable, no
-  // popover inside a popover (which Radix would fight over focus).
-  // Children go in `props.children` — the third argument of jsx() is the key.
-  const options = [
-    jsx('option', { value: '', children: t('whenNever') }, ''),
-    ...TRIGGER_GROUPS.map(group =>
-      jsx(
-        'optgroup',
-        {
-          label: group,
-          children: TRIGGERS.filter(trigger => trigger.group === group).map(trigger =>
-            jsx('option', { value: trigger.id, children: trigger.label }, trigger.id)
-          )
-        },
-        group
-      )
-    )
-  ]
+  // Flat list of selectable rows in render order, so the cursor can move over
+  // a grouped list without knowing about the groups.
+  const flat = [{ id: '', label: t('whenNever'), group: null }, ...TRIGGERS.map(trigger => trigger)]
 
-  return jsx('div', {
+  useEffect(() => {
+    if (!open) return
+    const onDown = event => {
+      if (!boxRef.current?.contains(event.target) && !event.target.closest?.('.hermes-sb-menu')) setOpen(false)
+    }
+    const onScroll = () => setOpen(false)
+    document.addEventListener('mousedown', onDown)
+    window.addEventListener('resize', onScroll)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      window.removeEventListener('resize', onScroll)
+    }
+  }, [open])
+
+  const toggle = () => {
+    haptic('tap')
+    if (open) {
+      setOpen(false)
+      return
+    }
+    const rect = boxRef.current?.getBoundingClientRect()
+    if (!rect) return
+    // `position: fixed` so the manage list's own `overflow-y: auto` cannot clip
+    // the menu, and the coordinates are viewport-relative because of it.
+    // Above the trigger when there is not enough room beneath (the panel sits
+    // just above the status bar, so its lower rows have almost none).
+    const below = window.innerHeight - rect.bottom
+    const up = below < 250 && rect.top > below
+    setPos({ left: Math.round(rect.left), top: Math.round(up ? rect.top - 2 : rect.bottom + 2), up })
+    setCursor(Math.max(0, flat.findIndex(row => row.id === (sound.trigger ?? ''))))
+    setOpen(true)
+  }
+
+  const pick = id => {
+    engine.bind(sound.id, id)
+    setOpen(false)
+    setCursor(-1)
+  }
+
+  const onKeyDown = event => {
+    if (event.key === 'Escape' && open) {
+      event.stopPropagation()
+      setOpen(false)
+      return
+    }
+    if (!open) {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        event.stopPropagation()
+        toggle()
+      }
+      return
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      event.stopPropagation()
+      const step = event.key === 'ArrowDown' ? 1 : -1
+      setCursor(index => Math.min(flat.length - 1, Math.max(0, (index < 0 ? 0 : index) + step)))
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      event.stopPropagation()
+      if (cursor >= 0) pick(flat[cursor].id)
+    } else if (event.key === 'Tab') {
+      setOpen(false)
+    }
+  }
+
+  let rowIndex = -1
+
+  return jsxs('div', {
+    ref: boxRef,
     className: 'hermes-sb-when',
-    children: jsx('select', {
-      className: 'hermes-sb-select',
-      value: sound.trigger ?? '',
-      'aria-label': `${t('when')}: ${sound.name}`,
-      title: sound.trigger ? TRIGGER_BY_ID.get(sound.trigger)?.detail : t('whenNever'),
-      onChange: event => engine.bind(sound.id, event.target.value),
-      children: options
-    })
+    onKeyDown,
+    children: [
+      jsx('button', {
+        type: 'button',
+        className: 'hermes-sb-picker',
+        'data-open': open,
+        'data-bound': Boolean(sound.trigger),
+        'aria-haspopup': 'listbox',
+        'aria-expanded': open,
+        'aria-label': `${t('when')}: ${sound.name}`,
+        title: current ? current.detail : t('whenNever'),
+        onClick: toggle,
+        children: [
+          jsx('span', { className: 'hermes-sb-picker-label', children: current ? current.label : t('whenNever') }),
+          jsx('span', { className: 'hermes-sb-picker-caret', 'aria-hidden': true })
+        ]
+      }),
+
+      open && pos
+        ? jsx('div', {
+            className: 'hermes-sb-menu',
+            'data-drop': pos.up ? 'up' : 'down',
+            style: { left: pos.left, top: pos.top },
+            role: 'listbox',
+            'aria-label': t('when'),
+            children: [
+              jsx(
+                'button',
+                {
+                  type: 'button',
+                  className: 'hermes-sb-menu-row',
+                  'data-selected': !sound.trigger,
+                  'data-cursor': cursor === (rowIndex += 1),
+                  onClick: () => pick(''),
+                  children: t('whenNever')
+                },
+                '__never'
+              ),
+              ...TRIGGER_GROUPS.map(group =>
+                jsxs(
+                  'div',
+                  {
+                    className: 'hermes-sb-menu-group',
+                    children: [
+                      jsx('div', { className: 'hermes-sb-menu-heading', children: group }),
+                      ...TRIGGERS.filter(trigger => trigger.group === group).map(trigger =>
+                        jsx(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'hermes-sb-menu-row',
+                            'data-selected': sound.trigger === trigger.id,
+                            'data-cursor': cursor === (rowIndex += 1),
+                            title: trigger.detail,
+                            onClick: () => pick(trigger.id),
+                            children: trigger.label
+                          },
+                          trigger.id
+                        )
+                      )
+                    ]
+                  },
+                  group
+                )
+              )
+            ]
+          })
+        : null
+    ]
   })
 }
 
