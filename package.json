@@ -1,0 +1,25 @@
+{
+  "name": "hermes-soundboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A soundboard for the Hermes Desktop bottom bar: synthesized cues plus your own audio files as pads.",
+  "license": "MIT",
+  "type": "module",
+  "main": "plugin.js",
+  "keywords": [
+    "hermes",
+    "hermes-desktop",
+    "desktop-plugin",
+    "soundboard",
+    "audio"
+  ],
+  "scripts": {
+    "test": "node test/harness.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "jsdom": "^26.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

@@ -1,0 +1,7 @@
+# Build artefacts of the headless test harness (borrowed toolchain junction).
+.build/
+
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
