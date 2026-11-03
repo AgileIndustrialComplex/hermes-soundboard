@@ -14,8 +14,9 @@
     "audio"
   ],
   "scripts": {
-    "test": "node test/harness.mjs && node test/preview.mjs",
+    "test": "node test/harness.mjs && node test/picker.mjs && node test/preview.mjs",
     "test:unit": "node test/harness.mjs",
+    "test:picker": "node test/picker.mjs",
     "test:ui": "node test/preview.mjs"
   },
   "devDependencies": {

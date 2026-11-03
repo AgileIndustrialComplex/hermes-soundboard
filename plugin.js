@@ -713,7 +713,9 @@ function Panel({ engine }) {
 
   const take = useCallback(
     async files => {
-      const list = Array.from(files || [])
+      // Snapshot immediately: a FileList handed over from an <input> can be
+      // emptied by the caller resetting it, and `await` gives that a chance.
+      const list = [...(files || [])]
       for (const file of list.slice(0, 8)) await engine.addFile(file)
     },
     [engine]
@@ -806,7 +808,10 @@ function Panel({ engine }) {
         multiple: true,
         style: { display: 'none' },
         onChange: event => {
-          const files = event.target.files
+          // `input.files` is a LIVE FileList: clearing `value` (which is what
+          // makes the same file pickable twice) empties it. Snapshot the files
+          // into a real array first, or nothing is ever added.
+          const files = [...event.target.files]
           event.target.value = ''
           void take(files)
         }

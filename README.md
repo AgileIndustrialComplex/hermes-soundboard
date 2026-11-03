@@ -114,19 +114,33 @@ throwing inside a render.
 
 ## Test
 
-Two suites, both runnable with `npm test`:
+Three suites, all runnable with `npm test`:
 
 ```bash
-npm test          # both
-npm run test:unit # jsdom harness, 25 assertions
-npm run test:ui   # render in Chromium, write PNGs to .build/
+npm test            # all three
+npm run test:unit   # jsdom harness, 25 assertions
+npm run test:picker # real file picker in Chromium, 8 assertions
+npm run test:ui     # render + geometry in Chromium, writes PNGs to .build/
 ```
 
 **`test/harness.mjs`** bundles the real `plugin.js` with esbuild, swaps the SDK
 for a stub with the same shapes, mounts every contribution in jsdom and drives
 them the way a user would — click a pad, press a number key, add a file, drop a
 file, refuse an oversized one, rename, delete, stop-all, Escape, then reload the
-plugin and corrupt the stored JSON. 25 assertions, all passing.
+plugin and corrupt the stored JSON. 25 assertions.
+
+**`test/picker.mjs`** drives a **real** `<input type="file">` with real `File`
+objects in Chromium: one mp3, the same mp3 twice, two at once, a 4 MB file, a
+`.txt`, then delete. 8 assertions.
+
+It exists because the jsdom harness could not have caught the bug it now guards.
+`input.files` is a **live `FileList`**: the plugin resets `input.value` after a
+pick (otherwise the same file cannot be chosen twice), and that reset empties
+`input.files`. Reading `event.target.files` straight into a variable therefore
+handed `addFile` an empty list, every time — the picker appeared to do nothing at
+all. jsdom let the harness assign `files` as a plain static property, so the
+suite passed while the shipped plugin was broken. The suite was confirmed to
+fail (5 checks, 4 failures) against the unfixed code before the fix was restored.
 
 **`test/preview.mjs`** renders the same plugin in a real Chromium against the
 app's theme variables and measures the result: pad count, grid columns, and
@@ -136,15 +150,15 @@ writes `preview-statusbar.png`, `preview-panel.png`, `preview-manage.png` and
 fine in code and wrong on screen — the padding asymmetry and the orphaned grid
 cell in this plugin were both found that way, not by reading the CSS.
 
-Both borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core` from
-an installed Hermes (`HERMES_DEPS_ROOT` points elsewhere if needed), precisely
-because the plugin itself declares no dependencies and this repository has no
-`node_modules`.
+All three borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core`
+from an installed Hermes (`HERMES_DEPS_ROOT` points elsewhere if needed),
+precisely because the plugin itself declares no dependencies and this repository
+has no `node_modules`.
 
 Passing these proves the plugin evaluates, registers, renders, persists, lays
-out and survives a disable/enable cycle. They do not replace looking at it: a
-status bar chip is 15 CSS px tall, and the final judgement of a popover is
-still the eye.
+out, and handles a real file pick. They do not replace looking at it: a status
+bar chip is 15 CSS px tall, and the final judgement of a popover is still the
+eye.
 
 ## License
 
