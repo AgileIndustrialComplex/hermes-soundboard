@@ -48,6 +48,17 @@ mode all persist per machine.
 - **Settings → Plugins → Soundboard.** Volume, whether the status-bar chip
   shows its label, and how many pads fit per row.
 
+## Screenshots
+
+![The soundboard popover](shots/preview-panel.png)
+
+| | |
+|---|---|
+| ![Manage mode](shots/preview-manage.png) | ![Settings page](shots/preview-settings.png) |
+| Manage mode — rename, preview, delete | Settings → Plugins → Soundboard |
+
+All three are produced by `npm run test:ui`, not by hand.
+
 ## Install
 
 Hermes Desktop loads plugins from `$HERMES_HOME/desktop-plugins/<id>/plugin.js`
