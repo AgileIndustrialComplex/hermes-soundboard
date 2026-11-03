@@ -37,9 +37,17 @@ mode all persist per machine.
   audio files straight onto the panel. Each file is copied into the plugin's
   private data folder as base64 and read back into a `data:` URL on first play,
   so a custom pad survives restarts without the original file staying put.
-- **Manage mode.** The pencil button lists every pad with an inline rename
-  field (Enter or blur commits, Escape reverts), a preview button and delete.
-  Deleting a custom pad also trashes its stored clip.
+- **Manage mode.** The pencil button lists every pad with a preview button, a
+  **"play when" trigger dropdown**, an inline rename field (Enter or blur
+  commits, Escape reverts) and delete. Deleting a custom pad also trashes its
+  stored clip.
+- **Triggers — the board plays itself.** Any pad can be bound to a live Hermes
+  event, so it fires on its own: the turn finishing (split by success / failure
+  / interruption), an approval or a question that has the agent blocked, a
+  warning notice, risky tool output, a session error, a subagent finishing,
+  context compaction, a heartbeat, a wake phrase, or affection detected in your
+  message. Bound pads carry a dot in the grid; the panel footer names the last
+  trigger that actually fired. See [Triggers](#triggers).
 - **Volume + mute.** One master volume, persisted. `■` stops everything and
   suspends the audio context.
 - **Keyboard.** While the panel is focused, `1`–`9` fire the first nine pads and
@@ -47,6 +55,43 @@ mode all persist per machine.
 - **⌘K command.** "Open Soundboard" from the command palette.
 - **Settings → Plugins → Soundboard.** Volume, whether the status-bar chip
   shows its label, and how many pads fit per row.
+
+## Triggers
+
+A binding is `pad → trigger`. The dropdown is grouped, and each entry maps to one
+real gateway event with a filter, so a pad reacts to "the turn finished
+successfully", not "every `message.complete` frame".
+
+| Group | Trigger | Underlying event | Fires when |
+|---|---|---|---|
+| Turn | Turn finishes | `message.complete` | status is not `error` / `interrupted` |
+| Turn | Turn fails | `message.complete` | status `error`, or `error` is set |
+| Turn | Turn interrupted | `message.complete` | status `interrupted` |
+| Turn | Turn starts | `message.start` | you sent a message (not an auto-continue) |
+| Attention | Approval needed | `approval.request` | the agent is blocked on approval |
+| Attention | Question asked | `clarify.request` | the agent is blocked on a question |
+| Attention | Warning notice | `notification.show` | level `warn` or `error` |
+| Attention | Risky tool output | `tool.output_risk` | injection / secret findings |
+| Attention | Session error | `error` | failure outside a turn |
+| Work | Subagent finishes | `subagent.complete` | a delegated child is done |
+| Work | Context compacted | `status.update` | kind `compacted` |
+| Ambient | Heartbeat fires | `status.update` | kind `heartbeat` |
+| Ambient | Wake phrase | `wake.detected` | your wake phrase fired |
+| Ambient | Affection detected | `reaction` | "good bot", "ily", a heart |
+
+Only the events the table names are subscribed — one listener per event, shared
+by every pad bound to it. A binding is validated on read, so a stale id in
+storage degrades to "never" instead of throwing.
+
+Hermes emits 88 named events in total (78 backend + 10 client-local); this
+plugin deliberately exposes the 14 that are worth interrupting a human for. The
+full set is the generated `GATEWAY_EVENT_TYPES` in
+`apps/shared/src/gateway-contract.generated.ts`.
+
+**On autoplay.** A triggered sound plays while the window may be unfocused, so
+the WebAudio context can be suspended by the browser's autoplay policy. Every
+trigger attempts a resume; if the platform refuses, the pad still lights up, so
+the cue is never silently lost.
 
 ## Screenshots
 
@@ -118,16 +163,17 @@ Three suites, all runnable with `npm test`:
 
 ```bash
 npm test            # all three
-npm run test:unit   # jsdom harness, 25 assertions
+npm run test:unit   # jsdom harness, 38 assertions
 npm run test:picker # real file picker in Chromium, 8 assertions
-npm run test:ui     # render + geometry in Chromium, writes PNGs to .build/
+npm run test:ui     # render + geometry + a fired trigger in Chromium
 ```
 
-**`test/harness.mjs`** bundles the real `plugin.js` with esbuild, swaps the SDK
+**`test/harness.mjs`** bundles
 for a stub with the same shapes, mounts every contribution in jsdom and drives
 them the way a user would — click a pad, press a number key, add a file, drop a
 file, refuse an oversized one, rename, delete, stop-all, Escape, then reload the
-plugin and corrupt the stored JSON. 25 assertions.
+plugin and corrupt the stored JSON, then bind pads to gateway events and emit
+real ones to prove only the right pad fires. 38 assertions.
 
 **`test/picker.mjs`** drives a **real** `<input type="file">` with real `File`
 objects in Chromium: one mp3, the same mp3 twice, two at once, a 4 MB file, a

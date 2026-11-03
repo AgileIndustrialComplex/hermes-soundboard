@@ -71,6 +71,13 @@ const ctx = {
     requestFolder: async () => ({ ok: false, error: 'unavailable', message: 'preview' })
   },
   notify: opts => console.log('[notify]', opts && opts.message),
+  // Gateway event stream, exposed so the suite can push a real event through.
+  onEvent: (type, listener) => {
+    window.__events ??= {}
+    window.__events[type] ??= []
+    window.__events[type].push(listener)
+    return () => {}
+  },
   onDispose: () => {},
   register: c => { contributions[c.id] = c },
   registerMany: list => { for (const c of list) contributions[c.id] = c },
@@ -309,6 +316,73 @@ await page.click('.hermes-sb-panel button[aria-label="Manage sounds"]')
 await page.waitForTimeout(250)
 await shot('preview-manage.png')
 console.log(`manage rows: ${await page.$$eval('.hermes-sb-row', nodes => nodes.length)}`)
+
+// ── triggers, measured in a real browser ────────────────────────────────
+const selects = await page.$$eval('.hermes-sb-select', nodes =>
+  nodes.map(node => ({
+    label: node.getAttribute('aria-label'),
+    options: [...node.options].map(option => ({ value: option.value, label: option.text })),
+    groups: [...node.querySelectorAll('optgroup')].map(group => group.label),
+    width: Math.round(node.getBoundingClientRect().width)
+  }))
+)
+console.log(`trigger selects: ${selects.length}`)
+if (selects.length) {
+  const first = selects[0]
+  console.log(`  groups: ${first.groups.join(' / ')}`)
+  console.log(`  options: ${first.options.length} (${first.options.slice(0, 3).map(o => o.label).join(', ')}…)`)
+  console.log(`  select width: ${first.width}px`)
+  if (first.options.length < 10) console.log('!! too few trigger options')
+  if (first.groups.length < 3) console.log('!! trigger options are not grouped')
+  // A select must fit inside a manage row without pushing the name field out.
+  const rowFit = await page.$eval('.hermes-sb-row', row => {
+    const name = row.querySelector('.hermes-sb-row-name')
+    const select = row.querySelector('.hermes-sb-select')
+    const buttons = [...row.querySelectorAll('.hermes-sb-rowbtn')]
+    const box = node => {
+      const r = node.getBoundingClientRect()
+      return { w: Math.round(r.width), h: Math.round(r.height), y: Math.round(r.y) }
+    }
+    return {
+      row: Math.round(row.getBoundingClientRect().width),
+      name: box(name),
+      select: box(select),
+      buttons: buttons.map(box)
+    }
+  })
+  console.log(`  row ${rowFit.row}px`)
+  console.log(`  name field ${rowFit.name.w}x${rowFit.name.h} @y${rowFit.name.y}`)
+  console.log(`  select     ${rowFit.select.w}x${rowFit.select.h} @y${rowFit.select.y}`)
+  console.log(`  buttons    ${rowFit.buttons.map(b => `${b.w}x${b.h}`).join(' ')}`)
+  if (rowFit.name.w < 88) console.log('!! the name field is crushed by the select')
+  // Row controls must share one height and one baseline, or the row reads as
+  // three different components stacked by accident.
+  const heights = new Set([rowFit.name.h, rowFit.select.h])
+  if (heights.size > 1) console.log(`!! control heights disagree: ${[...heights].join(' vs ')}`)
+  if (Math.abs(rowFit.name.y - rowFit.select.y) > 1) console.log(`!! baselines disagree: y${rowFit.name.y} vs y${rowFit.select.y}`)
+}
+
+// Bind a sound, fire the event, and confirm the pad lights up + the readout.
+const popSelect = page.locator('.hermes-sb-select').first()
+await popSelect.selectOption('attention.approval')
+await page.click('.hermes-sb-panel button[aria-label="Done"]')
+await page.waitForTimeout(200)
+const boundPads = await page.$$eval('.hermes-sb-pad[data-bound="true"]', nodes => nodes.length)
+console.log(`bound pads after binding one: ${boundPads}`)
+if (boundPads !== 1) console.log('!! the binding did not mark a pad')
+
+await page.evaluate(() => {
+  for (const listener of (window.__events['approval.request'] ?? [])) {
+    listener({ type: 'approval.request', payload: { prompt_id: 'p1' } })
+  }
+})
+await page.waitForTimeout(120)
+const flashed = await page.$$eval('.hermes-sb-pad[data-active="true"]', nodes =>
+  nodes.map(node => node.querySelector('.hermes-sb-pad-name')?.textContent)
+)
+console.log(`pads flashed by approval.request: ${JSON.stringify(flashed)}`)
+if (flashed.length !== 1) console.log('!! the bound sound did not fire in a real browser')
+await shot('preview-triggered.png')
 
 // Settings page.
 await page.evaluate(() => window.__mountSettings())

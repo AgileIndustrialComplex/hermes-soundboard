@@ -203,6 +203,137 @@ const DEFAULT_SOUNDS = SYNTHS.map(synth => ({
   synth: synth.id
 }))
 
+// ── triggers ──────────────────────────────────────────────────────────────
+// Every entry is a real gateway event from the generated contract in
+// apps/shared/src/gateway-contract.generated.ts (or a host-state transition).
+// `when(payload, event)` narrows a noisy event to the case worth a sound, so a
+// binding means "this event, in this situation" rather than "every frame".
+//
+// `shows` are the filter chips a pad gets while this trigger is selected:
+// each one is a further narrowing, so the dropdown stays short.
+
+const TRIGGERS = [
+  {
+    id: 'turn.complete',
+    event: 'message.complete',
+    group: 'Turn',
+    label: 'Turn finishes',
+    detail: 'any outcome',
+    when: payload => payload?.status !== 'error' && payload?.status !== 'interrupted'
+  },
+  {
+    id: 'turn.error',
+    event: 'message.complete',
+    group: 'Turn',
+    label: 'Turn fails',
+    detail: 'status = error',
+    when: payload => payload?.status === 'error' || Boolean(payload?.error)
+  },
+  {
+    id: 'turn.interrupted',
+    event: 'message.complete',
+    group: 'Turn',
+    label: 'Turn interrupted',
+    detail: 'status = interrupted',
+    when: payload => payload?.status === 'interrupted'
+  },
+  {
+    id: 'turn.start',
+    event: 'message.start',
+    group: 'Turn',
+    label: 'Turn starts',
+    detail: 'you hit send',
+    when: payload => payload?.display_kind !== 'auto_continue'
+  },
+  {
+    id: 'attention.approval',
+    event: 'approval.request',
+    group: 'Attention',
+    label: 'Approval needed',
+    detail: 'agent is blocked',
+    when: () => true
+  },
+  {
+    id: 'attention.clarify',
+    event: 'clarify.request',
+    group: 'Attention',
+    label: 'Question asked',
+    detail: 'agent is blocked',
+    when: () => true
+  },
+  {
+    id: 'attention.warning',
+    event: 'notification.show',
+    group: 'Attention',
+    label: 'Warning notice',
+    detail: 'level warn/error',
+    when: payload => payload?.level === 'warn' || payload?.level === 'error'
+  },
+  {
+    id: 'attention.risk',
+    event: 'tool.output_risk',
+    group: 'Attention',
+    label: 'Risky tool output',
+    detail: 'injection / secrets found',
+    when: () => true
+  },
+  {
+    id: 'attention.error',
+    event: 'error',
+    group: 'Attention',
+    label: 'Session error',
+    detail: 'outside a turn',
+    when: () => true
+  },
+  {
+    id: 'task.subagent',
+    event: 'subagent.complete',
+    group: 'Work',
+    label: 'Subagent finishes',
+    detail: 'a delegated child is done',
+    when: () => true
+  },
+  {
+    id: 'task.compacted',
+    event: 'status.update',
+    group: 'Work',
+    label: 'Context compacted',
+    detail: 'status kind = compacted',
+    when: payload => payload?.kind === 'compacted'
+  },
+  {
+    id: 'life.heartbeat',
+    event: 'status.update',
+    group: 'Ambient',
+    label: 'Heartbeat fires',
+    detail: 'status kind = heartbeat',
+    when: payload => payload?.kind === 'heartbeat'
+  },
+  {
+    id: 'life.wake',
+    event: 'wake.detected',
+    group: 'Ambient',
+    label: 'Wake phrase',
+    detail: 'you said the phrase',
+    when: () => true
+  },
+  {
+    id: 'life.reaction',
+    event: 'reaction',
+    group: 'Ambient',
+    label: 'Affection detected',
+    detail: '"good bot", "ily", a heart',
+    when: () => true
+  }
+]
+
+const TRIGGER_BY_ID = new Map(TRIGGERS.map(trigger => [trigger.id, trigger]))
+const TRIGGER_GROUPS = [...new Set(TRIGGERS.map(trigger => trigger.group))]
+
+function cleanTrigger(value) {
+  return typeof value === 'string' && TRIGGER_BY_ID.has(value) ? value : null
+}
+
 // ── data hygiene ──────────────────────────────────────────────────────────
 // Everything read back from storage is user-editable JSON, so each entry is
 // rebuilt from scratch; anything unrecognised is dropped rather than trusted.
@@ -221,8 +352,12 @@ function cleanSound(raw) {
   if (typeof raw.id !== 'string' || !ID_RE.test(raw.id)) return null
   const name = cleanName(raw.name, '')
   if (!name) return null
+  // A binding rides on the sound, so any sound can be a trigger — a synthesized
+  // cue or the user's own clip alike.
+  const trigger = cleanTrigger(raw.trigger)
+  const bound = trigger ? { trigger } : {}
   if (raw.kind === 'synth') {
-    return SYNTH_BY_ID.has(raw.synth) ? { id: raw.id, name, kind: 'synth', synth: raw.synth } : null
+    return SYNTH_BY_ID.has(raw.synth) ? { id: raw.id, name, kind: 'synth', synth: raw.synth, ...bound } : null
   }
   if (raw.kind === 'file' && typeof raw.mime === 'string' && MIME_RE.test(raw.mime)) {
     return {
@@ -230,7 +365,8 @@ function cleanSound(raw) {
       name,
       kind: 'file',
       mime: raw.mime,
-      bytes: Number.isFinite(raw.bytes) && raw.bytes > 0 ? Math.round(raw.bytes) : 0
+      bytes: Number.isFinite(raw.bytes) && raw.bytes > 0 ? Math.round(raw.bytes) : 0,
+      ...bound
     }
   }
 
@@ -330,6 +466,8 @@ function createEngine(ctx) {
   const open = atom(false)
   const active = atom({})
   const saving = atom(false)
+  /** The most recent trigger that actually fired, for the panel's readout. */
+  const lastTrigger = atom(null)
 
   const timers = new Set()
   const urls = new Map()
@@ -414,6 +552,62 @@ function createEngine(ctx) {
     const gain = settings.get().volume / 100
     if (sound.kind === 'synth') playSynth(sound.synth, gain)
     else void playFile(sound, gain).catch(error => ctx.notify?.({ kind: 'error', message: String(error.message || error) }))
+  }
+
+  // Triggered playback is different from a click: the window is usually NOT
+  // focused, so the AudioContext may be suspended by the browser's autoplay
+  // policy and a resumed context is not guaranteed. Every trigger attempts a
+  // resume; if the context refuses, the pad still flashes so the cue is not
+  // silently lost, and the panel shows the last trigger.
+  const bound = () => sounds.get().filter(sound => sound.trigger)
+
+  function fire(triggerId, event) {
+    if (disposed) return
+    const trigger = TRIGGER_BY_ID.get(triggerId)
+    if (!trigger) return
+    let payload = null
+    try {
+      payload = event?.payload ?? null
+      if (!trigger.when(payload, event)) return
+    } catch {
+      // A malformed payload must never take the event stream down.
+      return
+    }
+    lastTrigger.set({ id: triggerId, at: Date.now() })
+    let fired = 0
+    for (const sound of bound()) {
+      if (sound.trigger !== triggerId) continue
+      flash(sound.id)
+      fired += 1
+      const gain = settings.get().volume / 100
+      if (gain <= 0) continue
+      if (sound.kind === 'synth') playSynth(sound.synth, gain)
+      else void playFile(sound, gain).catch(() => {})
+    }
+    // A trigger with no pad bound to it is not "the last trigger" — the
+    // readout should name something that actually made a sound.
+    if (!fired) lastTrigger.set(null)
+  }
+
+  // One subscription per distinct event, not per binding: several pads can hang
+  // off `message.complete` and the stream only needs to be read once.
+  for (const eventName of new Set(TRIGGERS.map(trigger => trigger.event))) {
+    ctx.onEvent?.(eventName, event => {
+      for (const trigger of TRIGGERS) {
+        if (trigger.event === eventName) fire(trigger.id, event)
+      }
+    })
+  }
+
+  function bind(soundId, triggerId) {
+    const next = cleanTrigger(triggerId)
+    persistSounds(
+      sounds.get().map(sound => {
+        if (sound.id !== soundId) return sound
+        const { trigger: _drop, ...rest } = sound
+        return next ? { ...rest, trigger: next } : rest
+      })
+    )
   }
 
   function stopAll() {
@@ -536,12 +730,14 @@ function createEngine(ctx) {
     open,
     active,
     saving,
+    lastTrigger,
     play,
     stopAll,
     addFile,
     addPreset,
     remove,
     rename,
+    bind,
     restorePresets,
     setVolume: volume => persistSettings({ volume }),
     setShowLabel: showLabel => persistSettings({ showLabel }),
@@ -583,6 +779,11 @@ const CSS = `
    differ without a second line of text in every tile. */
 .hermes-sb-pad[data-custom=true]::after{content:"";position:absolute;left:50%;bottom:4px;width:10px;height:1px;transform:translateX(-50%);background:color-mix(in srgb,var(--ui-text-primary) 30%,transparent)}
 .hermes-sb-pad[data-active=true][data-custom=true]::after{background:var(--ui-accent)}
+/* A bound pad carries a small dot top-right: the binding is invisible in the
+   grid otherwise, and a user needs to know which pads will fire on their own. */
+.hermes-sb-pad[data-bound=true]::before{content:"";position:absolute;top:4px;right:4px;width:4px;height:4px;
+  border-radius:50%;background:var(--ui-accent);opacity:.75}
+.hermes-sb-pad[data-bound=true][data-active=true]::before{opacity:1}
 .hermes-sb-pad-name{max-width:100%;font-size:11px;line-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-pad-key{position:absolute;top:2px;left:4px;font-size:9px;line-height:10px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums}
 .hermes-sb-pad[data-active=true] .hermes-sb-pad-key{color:var(--ui-accent)}
@@ -595,9 +796,28 @@ const CSS = `
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
 .hermes-sb-row{display:flex;align-items:center;gap:4px}
 .hermes-sb-row .hermes-sb-row-name{flex:1;min-width:0;font-size:11px}
+/* The trigger select is the widest content in a manage row (longest label is
+   "Risky tool output"), so it gets the larger share and the name field shrinks
+   to roughly 12 characters — enough for a pad name, no more.
+   Height and box-sizing are pinned to the row's other controls (the 22px
+   buttons, the 21px name field) so all four share one baseline; the native
+   select's own metrics otherwise leave it 5px shorter and 3px lower. */
+.hermes-sb-when{flex:0 0 124px;min-width:0;display:flex;align-items:center;height:22px}
+.hermes-sb-select{width:100%;height:21px;box-sizing:border-box;margin:0;font:inherit;font-size:10px;line-height:15px;
+  padding:1px 15px 1px 4px;border-radius:3px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary);outline:none;
+  appearance:none;-webkit-appearance:none;text-overflow:ellipsis;
+  background-image:linear-gradient(45deg,transparent 50%,var(--ui-text-quaternary) 50%),linear-gradient(135deg,var(--ui-text-quaternary) 50%,transparent 50%);
+  background-position:calc(100% - 9px) 55%,calc(100% - 5px) 55%;
+  background-size:4px 4px,4px 4px;background-repeat:no-repeat}
+.hermes-sb-select:hover{border-color:var(--ui-stroke-primary)}
+.hermes-sb-select:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
+.hermes-sb-row[data-bound=true] .hermes-sb-select{color:var(--ui-accent);border-color:color-mix(in srgb,var(--ui-accent) 45%,var(--ui-stroke-secondary))}
 .hermes-sb-rowbtn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex-shrink:0;border-radius:4px;color:var(--ui-text-tertiary)}
 .hermes-sb-rowbtn:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
-.hermes-sb-rowbtn[data-destructive=true]:hover{color:var(--ui-red)}
+.hermes-sb-rowbtn[data-destructive=true]{color:var(--ui-text-secondary)}
+.hermes-sb-rowbtn[data-destructive=true]:hover{background:color-mix(in srgb,var(--ui-red) 18%,transparent);color:var(--ui-red)}
 .hermes-sb-section{padding:8px 4px 2px;font-size:9px;line-height:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-quaternary)}
 .hermes-sb-presets{display:flex;flex-wrap:wrap;gap:4px;padding:2px}
 .hermes-sb-preset{padding:2px 7px;border-radius:999px;background:var(--ui-bg-quaternary);font-size:11px;line-height:16px;color:var(--ui-text-secondary)}
@@ -609,6 +829,7 @@ const CSS = `
 .hermes-sb-foot-icon:hover{color:var(--ui-text-secondary)}
 .hermes-sb-foot input[type=range]{flex:1;min-width:0;height:3px;accent-color:var(--ui-accent);cursor:pointer}
 .hermes-sb-foot-value{width:30px;flex-shrink:0;text-align:right;font-size:10px;line-height:12px;font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
+.hermes-sb-last{padding:4px 6px 0;font-size:9px;line-height:12px;color:var(--ui-text-quaternary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-drop{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:color-mix(in srgb,var(--ui-bg-elevated) 90%,transparent);box-shadow:inset 0 0 0 2px var(--ui-accent);font-size:11px;color:var(--ui-accent);z-index:5}
 .hermes-sb-body{position:relative}
 `
@@ -624,7 +845,10 @@ function Pad({ sound, index, engine }) {
     // Present only on a custom pad: React renders boolean `data-*` as the
     // string "false", and an always-present attribute would read as truthy.
     ...(sound.kind === 'file' ? { 'data-custom': 'true' } : {}),
-    title: sound.kind === 'file' ? `${sound.name} — your audio file` : `${sound.name} — built-in tone`,
+    ...(sound.trigger ? { 'data-bound': 'true' } : {}),
+    title: sound.trigger
+      ? `${sound.name} — plays on “${TRIGGER_BY_ID.get(sound.trigger)?.label}”`
+      : sound.kind === 'file' ? `${sound.name} — your audio file` : `${sound.name} — built-in tone`,
     'aria-label': sound.name,
     onClick: () => {
       haptic('tap')
@@ -635,6 +859,41 @@ function Pad({ sound, index, engine }) {
       jsx('span', { className: 'hermes-sb-pad-name', children: sound.name })
     ]
   }, sound.id)
+}
+
+function TriggerSelect({ sound, engine }) {
+  const t = usePluginI18n(ID)
+
+  // A native <select> on purpose: 14 grouped options, keyboard-operable, no
+  // popover inside a popover (which Radix would fight over focus).
+  // Children go in `props.children` — the third argument of jsx() is the key.
+  const options = [
+    jsx('option', { value: '', children: t('whenNever') }, ''),
+    ...TRIGGER_GROUPS.map(group =>
+      jsx(
+        'optgroup',
+        {
+          label: group,
+          children: TRIGGERS.filter(trigger => trigger.group === group).map(trigger =>
+            jsx('option', { value: trigger.id, children: trigger.label }, trigger.id)
+          )
+        },
+        group
+      )
+    )
+  ]
+
+  return jsx('div', {
+    className: 'hermes-sb-when',
+    children: jsx('select', {
+      className: 'hermes-sb-select',
+      value: sound.trigger ?? '',
+      'aria-label': `${t('when')}: ${sound.name}`,
+      title: sound.trigger ? TRIGGER_BY_ID.get(sound.trigger)?.detail : t('whenNever'),
+      onChange: event => engine.bind(sound.id, event.target.value),
+      children: options
+    })
+  })
 }
 
 function ManageRow({ sound, engine }) {
@@ -652,6 +911,7 @@ function ManageRow({ sound, engine }) {
 
   return jsxs('div', {
     className: 'hermes-sb-row',
+    'data-bound': Boolean(sound.trigger),
     children: [
       jsx(Tip, {
         label: t('preview'),
@@ -663,6 +923,7 @@ function ManageRow({ sound, engine }) {
           children: jsx(icons.Play, { size: 11 })
         })
       }),
+      jsx(TriggerSelect, { sound, engine }),
       jsx(Input, {
         className: 'hermes-sb-row-name',
         size: 'xs',
@@ -702,6 +963,7 @@ function Panel({ engine }) {
   const sounds = useValue(engine.sounds)
   const settings = useValue(engine.settings)
   const saving = useValue(engine.saving)
+  const last = useValue(engine.lastTrigger)
   const [manage, setManage] = useState(false)
   const [dragging, setDragging] = useState(false)
   const panelRef = useRef(null)
@@ -902,6 +1164,16 @@ function Panel({ engine }) {
         ]
       }),
 
+      // A binding firing while the panel happens to be open is otherwise
+      // invisible: the pads are shut away behind the popover trigger.
+      last && TRIGGER_BY_ID.has(last.id)
+        ? jsx('div', {
+            className: 'hermes-sb-last',
+            role: 'status',
+            children: t('lastTrigger', TRIGGER_BY_ID.get(last.id).label)
+          })
+        : null,
+
       dragging ? jsx('div', { className: 'hermes-sb-drop', children: t('dropHere') }) : null
     ]
   })
@@ -1020,6 +1292,9 @@ const LOCALES = {
     volume: 'Volume',
     mute: 'Mute',
     unmute: 'Unmute',
+    when: 'Play this sound when',
+    whenNever: 'Never',
+    lastTrigger: trigger => `Last trigger: ${trigger}`,
     showLabel: 'Show the Soundboard label in the status bar',
     empty: 'No sounds yet. Add an audio file, or drop one here.',
     restore: 'Restore built-in sounds',
@@ -1046,6 +1321,9 @@ const LOCALES = {
     volume: 'Głośność',
     mute: 'Wycisz',
     unmute: 'Wyłącz wyciszenie',
+    when: 'Odtwórz ten dźwięk gdy',
+    whenNever: 'Nigdy',
+    lastTrigger: trigger => `Ostatni wyzwalacz: ${trigger}`,
     showLabel: 'Pokazuj podpis Soundboard na pasku stanu',
     empty: 'Brak dźwięków. Dodaj plik audio albo przeciągnij go tutaj.',
     restore: 'Przywróć dźwięki wbudowane',

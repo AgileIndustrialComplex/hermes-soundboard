@@ -181,6 +181,17 @@ globalThis.Audio = window.Audio
 const storage = new Map()
 const notifications = []
 const files = new Map()
+/** event type → the listeners currently subscribed to it. */
+const events = new Map()
+
+/** Emit a gateway event the way the host does, then let React flush. Waits for
+ *  any previous flash to expire first, so each assertion sees only its own. */
+const emit = async (type, payload) => {
+  await new Promise(resolve => setTimeout(resolve, 260))
+  for (const listener of events.get(type) ?? []) listener({ type, payload })
+  await Promise.resolve()
+  await new Promise(resolve => setTimeout(resolve, 0))
+}
 
 const makeCtx = () => {
   const contributions = []
@@ -229,6 +240,14 @@ const makeCtx = () => {
     },
     notify: opts => notifications.push(opts),
     notifyError: message => notifications.push({ kind: 'error', message }),
+    // Gateway event stream: the plugin subscribes by event type. Emitting here
+    // is how the harness plays "the app said a turn finished".
+    onEvent: (type, listener) => {
+      const set = events.get(type) ?? new Set()
+      set.add(listener)
+      events.set(type, set)
+      return () => set.delete(listener)
+    },
     i18n: {
       register: bundle => Object.assign(locales, bundle),
       t: (key, ...args) => {
@@ -515,6 +534,105 @@ click(iconButton('Done'))
 check('leaving manage mode shows the pad grid again', () => {
   if (!pads().length) throw new Error('no pads')
 })
+
+// ── triggers ────────────────────────────────────────────────────────────
+// Every pad carries a "play when" select; a bound pad fires on its gateway
+// event and stays silent for every other one.
+const selectFor = name => [...(panel()?.querySelectorAll('.hermes-sb-select') ?? [])].find(select =>
+  (select.getAttribute('aria-label') ?? '').endsWith(name)
+)
+const setSelect = (select, value) => {
+  act(() => {
+    select.value = value
+    select.dispatchEvent(new window.Event('change', { bubbles: true }))
+  })
+}
+
+click(iconButton('Manage sounds'))
+check('every manage row offers a trigger select', () => {
+  const selects = panel().querySelectorAll('.hermes-sb-select')
+  if (selects.length !== rows().length) throw new Error(`${selects.length} selects for ${rows().length} rows`)
+  const options = selects[0].querySelectorAll('option')
+  if (options.length < 10) throw new Error(`only ${options.length} options`)
+  if (options[0].value !== '') throw new Error('the first option must be "never"')
+})
+check('trigger options are grouped', () => {
+  const groups = panel().querySelectorAll('.hermes-sb-select optgroup')
+  if (groups.length < 3) throw new Error(`only ${groups.length} groups`)
+})
+
+const popSelect = selectFor('Pop')
+setSelect(popSelect, 'attention.approval')
+check('binding a trigger persists on the sound', () => {
+  const saved = JSON.parse(storage.get('sounds'))
+  const pop = saved.find(sound => sound.name === 'Pop')
+  if (pop.trigger !== 'attention.approval') throw new Error(`trigger=${pop.trigger}`)
+})
+check('a bound row is marked', () => {
+  const row = rows().find(item => item.querySelector('.hermes-sb-select')?.value === 'attention.approval')
+  if (!row || row.getAttribute('data-bound') !== 'true') throw new Error('row not marked bound')
+})
+
+const dingSelect = selectFor('Ding')
+setSelect(dingSelect, 'turn.complete')
+click(iconButton('Done'))
+check('a bound pad shows a dot in the grid', () => {
+  const bound = [...panel().querySelectorAll('.hermes-sb-pad')].filter(pad => pad.getAttribute('data-bound') === 'true')
+  if (bound.length !== 2) throw new Error(`${bound.length} pads marked bound`)
+})
+
+const oscillatorsBefore = audioLog.oscillators
+await emit('approval.request', { prompt_id: 'p1', command: 'rm -rf /' })
+check('an approval request plays its bound sound only', () => {
+  // One flash, one cue: the Ding pad is bound to a different event.
+  const activePads = [...panel().querySelectorAll('.hermes-sb-pad')].filter(pad => pad.getAttribute('data-active') === 'true')
+  if (activePads.length !== 1) throw new Error(`${activePads.length} pads flashed`)
+  if (!activePads[0].textContent.includes('Pop')) throw new Error(`wrong pad: ${activePads[0].textContent}`)
+  if (audioLog.oscillators <= oscillatorsBefore) throw new Error('no sound scheduled')
+})
+
+await emit('message.complete', { status: 'complete', text: 'done' })
+check('a turn-complete event plays the other binding', () => {
+  const activePads = [...panel().querySelectorAll('.hermes-sb-pad')].filter(pad => pad.getAttribute('data-active') === 'true')
+  if (activePads.length !== 1) throw new Error(`${activePads.length} pads flashed`)
+  if (!activePads[0].textContent.includes('Ding')) throw new Error(`wrong pad: ${activePads[0].textContent}`)
+})
+check('the last-trigger readout reports what fired', () => {
+  const readout = panel().querySelector('.hermes-sb-last')
+  if (!readout) throw new Error('no readout')
+  if (!/Turn finishes/.test(readout.textContent)) throw new Error(readout.textContent)
+})
+
+const beforeSilent = audioLog.oscillators
+await emit('message.complete', { status: 'error', error: 'boom' })
+check('an unbound outcome of a bound event stays silent', () => {
+  // `turn.complete` filters status != error, so a failed turn plays nothing.
+  if ([...panel().querySelectorAll('.hermes-sb-pad[data-active="true"]')].length) throw new Error('a pad flashed on a failed turn')
+})
+
+await emit('error', { message: 'session blew up' })
+check('an event with no binding anywhere plays nothing', () => {
+  const active = [...panel().querySelectorAll('.hermes-sb-pad[data-active="true"]')]
+  if (active.length) throw new Error(`${active.length} pads flashed for an unbound event`)
+})
+check('the readout clears when a trigger fired nothing', () => {
+  if (panel().querySelector('.hermes-sb-last')) throw new Error('stale readout survived')
+})
+
+// Unbinding returns the pad to click-only.
+click(iconButton('Manage sounds'))
+setSelect(selectFor('Ding'), '')
+check('choosing "never" clears the binding', () => {
+  const saved = JSON.parse(storage.get('sounds'))
+  const ding = saved.find(sound => sound.name === 'Ding')
+  if (ding.trigger !== undefined) throw new Error(`trigger still ${ding.trigger}`)
+})
+const afterUnbind = audioLog.oscillators
+await emit('message.complete', { status: 'complete' })
+check('an unbound sound no longer fires', () => {
+  if ([...panel().querySelectorAll('.hermes-sb-pad[data-active="true"]')].length) throw new Error('a pad flashed')
+})
+click(iconButton('Done'))
 
 // Stop all + close.
 click(iconButton('Stop all sounds'))
