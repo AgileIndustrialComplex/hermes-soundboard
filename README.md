@@ -8,20 +8,21 @@ network), plus any audio files you add. Names, order, volume and a "manage"
 mode all persist per machine.
 
 ```
-┌───────────────────────────────────────────────┐
-│  … status bar …            ▮▮▮▮ Soundboard  ⟩ │  ← chip
-└───────────────────────────────────────────────┘
-                   ▲
-        ┌──────────────────────┐
-        │ SOUNDBOARD      ■ + ✎│
-        │ ┌────┐┌────┐┌────┐  │
-        │ │Pop ││Ding││Beep│  │  ← pads (1–9 = keys)
-        │ └────┘└────┘└────┘  │
-        │ ┌────┐┌────┐┌────┐  │
-        │ │Coin││Lsr ││Whsh│  │
-        │ └────┘└────┘└────┘  │
-        │ 🔊 ▬▬▬▬▬▬▬▬▬▬  80%  │
-        └──────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  … status bar …              ≋ Soundboard  42%  │  ← chip
+└──────────────────────────────────────────────────┘
+                       ▲
+        ┌──────────────────────────────┐
+        │ SOUNDBOARD           ■  +  ✎ │
+        │ ┌────┐ ┌────┐ ┌────┐ ┌────┐  │
+        │ │1Pop│ │2Dng│ │3Bep│ │4Con│  │  ← 1–9 = keys
+        │ └────┘ └────┘ └────┘ └────┘  │
+        │ ┌────┐ ┌────┐ ┌────┐ ┌────┐  │
+        │ │5Lsr│ │6Whs│ │7Bng│ │ +  │  │  ← + adds a file
+        │ └────┘ └────┘ └────┘ └────┘  │
+        │ ──────────────────────────── │
+        │ 🔊 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬   80% │
+        └──────────────────────────────┘
 ```
 
 ## What it does
@@ -71,7 +72,7 @@ file). The plugin is enabled by default; it stays off if you toggle it off in
 
 ## Limits, on purpose
 
-- 40 pads maximum, 3 MB per audio file. `ctx.files` refuses text beyond 4 MiB
+- 40 sounds maximum, 3 MB per audio file. `ctx.files` refuses text beyond 4 MiB
   and base64 inflates by 4/3, so 3 MB is the largest clip that reliably fits.
 - Soundboard clips are meant to be short. Anything long belongs in a player, not
   a pad.
@@ -96,24 +97,43 @@ only file door a plugin gets, and it is text (plus `readDataUrl`) oriented. No
 `window.hermesDesktop` calls, no DOM reach into the app, no hardcoded colours —
 all of it is theme variables, so the pads follow whatever skin is active.
 
+Everything read back out of storage is rebuilt field by field before use, so a
+hand-edited or half-written JSON blob degrades to the built-ins instead of
+throwing inside a render.
+
 ## Test
 
-The harness bundles the real `plugin.js` with esbuild, swaps the SDK for a stub
-with the same shapes, mounts every contribution in jsdom and drives them the way
-a user would — add a file, drop a file, rename, delete, reload, corrupt the
-stored JSON — through 25 assertions.
+Two suites, both runnable with `npm test`:
 
 ```bash
-npm test
+npm test          # both
+npm run test:unit # jsdom harness, 25 assertions
+npm run test:ui   # render in Chromium, write PNGs to .build/
 ```
 
-It borrows `esbuild`, `jsdom`, `react` and `react-dom` from an installed Hermes
-(`HERMES_DEPS_ROOT` points it elsewhere if needed) precisely because the plugin
-itself declares no dependencies and this repository has no `node_modules`.
+**`test/harness.mjs`** bundles the real `plugin.js` with esbuild, swaps the SDK
+for a stub with the same shapes, mounts every contribution in jsdom and drives
+them the way a user would — click a pad, press a number key, add a file, drop a
+file, refuse an oversized one, rename, delete, stop-all, Escape, then reload the
+plugin and corrupt the stored JSON. 25 assertions, all passing.
 
-Passing the harness proves the plugin evaluates, registers, renders, persists
-and survives a disable/enable cycle. It says nothing about whether it looks
-right inside the app — that still needs eyes on the real window.
+**`test/preview.mjs`** renders the same plugin in a real Chromium against the
+app's theme variables and measures the result: pad count, grid columns, and
+whether the header, grid and volume row share one left and one right edge. It
+writes `preview-statusbar.png`, `preview-panel.png`, `preview-manage.png` and
+`preview-settings.png` to `.build/`. That is what catches a layout that reads
+fine in code and wrong on screen — the padding asymmetry and the orphaned grid
+cell in this plugin were both found that way, not by reading the CSS.
+
+Both borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core` from
+an installed Hermes (`HERMES_DEPS_ROOT` points elsewhere if needed), precisely
+because the plugin itself declares no dependencies and this repository has no
+`node_modules`.
+
+Passing these proves the plugin evaluates, registers, renders, persists, lays
+out and survives a disable/enable cycle. They do not replace looking at it: a
+status bar chip is 15 CSS px tall, and the final judgement of a popover is
+still the eye.
 
 ## License
 

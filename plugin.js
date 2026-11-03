@@ -561,20 +561,33 @@ const CSS = `
 .hermes-sb-chip-label{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-panel{width:308px;max-width:calc(100vw - 24px);outline:none}
 .hermes-sb-head{display:flex;align-items:center;gap:2px;padding:0 0 6px}
-.hermes-sb-head-title{flex:1;min-width:0;padding-left:4px;font-size:10px;line-height:14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-quaternary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-sb-head-title{flex:1;min-width:0;padding-left:4px;font-size:10px;line-height:14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-iconbtn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:4px;color:var(--ui-text-tertiary);background:transparent;flex-shrink:0}
 .hermes-sb-iconbtn:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
 .hermes-sb-iconbtn[data-on=true]{color:var(--ui-accent)}
 .hermes-sb-iconbtn:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
-.hermes-sb-grid{display:grid;gap:6px;max-height:min(46vh,300px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
-.hermes-sb-pad{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;height:46px;min-width:0;padding:4px 4px 3px;border-radius:5px;background:var(--ui-bg-quaternary);color:var(--ui-text-primary);transition:background-color .1s,box-shadow .1s}
+.hermes-sb-iconbtn:disabled{cursor:default;opacity:.5}
+/* No reserved scrollbar gutter: a stable gutter reserves ~15px on the right
+   only, which made the grid visibly right-heavy against its 4px left inset.
+   The pads shrink slightly once a tenth sound makes the list scroll; that is a
+   better trade than a permanent asymmetry. */
+.hermes-sb-grid{display:grid;gap:6px;max-height:min(46vh,300px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-width:thin}
+.hermes-sb-pad{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;height:42px;min-width:0;padding:0 5px;border-radius:5px;background:var(--ui-bg-quaternary);color:var(--ui-text-primary);transition:background-color .1s,box-shadow .1s}
 .hermes-sb-pad:hover{background:var(--chrome-action-hover)}
 .hermes-sb-pad:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
-.hermes-sb-pad[data-active=true]{background:color-mix(in srgb,var(--ui-accent) 20%,var(--ui-bg-quaternary));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ui-accent) 65%,transparent)}
+.hermes-sb-pad[data-active=true]{background:color-mix(in srgb,var(--ui-accent) 22%,var(--ui-bg-quaternary));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ui-accent) 70%,transparent)}
+/* A custom pad gets a hairline underscore so "my file" and "built-in tone"
+   differ without a second line of text in every tile. */
+.hermes-sb-pad[data-custom=true]::after{content:"";position:absolute;left:50%;bottom:4px;width:10px;height:1px;transform:translateX(-50%);background:color-mix(in srgb,var(--ui-text-primary) 30%,transparent)}
+.hermes-sb-pad[data-active=true][data-custom=true]::after{background:var(--ui-accent)}
 .hermes-sb-pad-name{max-width:100%;font-size:11px;line-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hermes-sb-pad-meta{font-size:9px;line-height:11px;color:var(--ui-text-quaternary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-.hermes-sb-pad-key{position:absolute;top:1px;left:4px;font-size:9px;line-height:11px;color:var(--ui-text-quaternary)}
-.hermes-sb-pad[data-active=true] .hermes-sb-pad-meta{color:var(--ui-accent)}
+.hermes-sb-pad-key{position:absolute;top:2px;left:4px;font-size:9px;line-height:10px;color:var(--ui-text-tertiary);font-variant-numeric:tabular-nums}
+.hermes-sb-pad[data-active=true] .hermes-sb-pad-key{color:var(--ui-accent)}
+/* The trailing "+" tile: the same footprint as a pad so the grid stays even,
+   dashed and quieter so it never reads as a sound. */
+.hermes-sb-add{align-items:center;justify-content:center;background:transparent;box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary);color:var(--ui-text-quaternary)}
+.hermes-sb-add:hover{background:var(--chrome-action-hover);box-shadow:inset 0 0 0 1px var(--ui-stroke-primary);color:var(--ui-text-secondary)}
+.hermes-sb-add:disabled{opacity:.5;cursor:default}
 .hermes-sb-empty{padding:18px 8px;text-align:center;font-size:11px;line-height:16px;color:var(--ui-text-tertiary)}
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
 .hermes-sb-row{display:flex;align-items:center;gap:4px}
@@ -586,22 +599,29 @@ const CSS = `
 .hermes-sb-presets{display:flex;flex-wrap:wrap;gap:4px;padding:2px}
 .hermes-sb-preset{padding:2px 7px;border-radius:999px;background:var(--ui-bg-quaternary);font-size:11px;line-height:16px;color:var(--ui-text-secondary)}
 .hermes-sb-preset:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
-.hermes-sb-foot{display:flex;align-items:center;gap:6px;padding:8px 4px 2px;margin-top:6px;border-top:1px solid var(--ui-stroke-secondary)}
+/* Volume row: same 4px inner inset and the same right column width as the grid
+   above, so the two rows share one left and one right anchor. */
+.hermes-sb-foot{display:flex;align-items:center;gap:6px;padding:7px 6px 1px;margin-top:6px;border-top:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-foot-icon{display:inline-flex;flex-shrink:0;color:var(--ui-text-quaternary);cursor:pointer;border-radius:3px}
+.hermes-sb-foot-icon:hover{color:var(--ui-text-secondary)}
 .hermes-sb-foot input[type=range]{flex:1;min-width:0;height:3px;accent-color:var(--ui-accent);cursor:pointer}
-.hermes-sb-foot-value{width:30px;text-align:right;font-size:10px;font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
+.hermes-sb-foot-value{width:30px;flex-shrink:0;text-align:right;font-size:10px;line-height:12px;font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
 .hermes-sb-drop{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:color-mix(in srgb,var(--ui-bg-elevated) 90%,transparent);box-shadow:inset 0 0 0 2px var(--ui-accent);font-size:11px;color:var(--ui-accent);z-index:5}
 .hermes-sb-body{position:relative}
 `
 
 // ── UI ────────────────────────────────────────────────────────────────────
 
-function Pad({ sound, index, engine, columns }) {
+function Pad({ sound, index, engine }) {
   const active = useValue(engine.active)
   return jsxs('button', {
     type: 'button',
     className: 'hermes-sb-pad',
     'data-active': Boolean(active[sound.id]),
-    title: `${sound.name} — click to play`,
+    // Present only on a custom pad: React renders boolean `data-*` as the
+    // string "false", and an always-present attribute would read as truthy.
+    ...(sound.kind === 'file' ? { 'data-custom': 'true' } : {}),
+    title: sound.kind === 'file' ? `${sound.name} — your audio file` : `${sound.name} — built-in tone`,
     'aria-label': sound.name,
     onClick: () => {
       haptic('tap')
@@ -609,8 +629,7 @@ function Pad({ sound, index, engine, columns }) {
     },
     children: [
       index < 9 ? jsx('span', { className: 'hermes-sb-pad-key', 'aria-hidden': true, children: String(index + 1) }) : null,
-      jsx('span', { className: 'hermes-sb-pad-name', children: sound.name }),
-      jsx('span', { className: 'hermes-sb-pad-meta', 'aria-hidden': true, children: sound.kind === 'synth' ? 'tone' : sound.bytes ? `${Math.max(1, Math.round(sound.bytes / 1024))} kB` : 'audio' })
+      jsx('span', { className: 'hermes-sb-pad-name', children: sound.name })
     ]
   }, sound.id)
 }
@@ -820,7 +839,22 @@ function Panel({ engine }) {
           ? jsx('div', {
               className: 'hermes-sb-grid',
               style: { gridTemplateColumns: `repeat(${settings.padsPerRow}, minmax(0, 1fr))` },
-              children: sounds.slice(0, 24).map((sound, index) => jsx(Pad, { sound, index, engine }, sound.id))
+              children: [
+                ...sounds.slice(0, 24).map((sound, index) => jsx(Pad, { sound, index, engine }, sound.id)),
+                // The insertion point lives where the list ends, and it fills
+                // the short last row a 7-pad board would otherwise leave empty.
+                sounds.length < MAX_SOUNDS
+                  ? jsx('button', {
+                      type: 'button',
+                      className: 'hermes-sb-pad hermes-sb-add',
+                      title: t('addSound'),
+                      'aria-label': t('addSound'),
+                      disabled: saving,
+                      onClick: () => fileRef.current?.click(),
+                      children: jsx(icons.Plus, { size: 13, 'aria-hidden': true })
+                    }, 'add')
+                  : null
+              ]
             })
           : jsxs('div', {
               className: 'hermes-sb-empty',
@@ -839,7 +873,14 @@ function Panel({ engine }) {
       jsxs('div', {
         className: 'hermes-sb-foot',
         children: [
-          jsx(icons.Volume2, { size: 11, 'aria-hidden': true, style: { color: 'var(--ui-text-quaternary)', flexShrink: 0 } }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-foot-icon',
+            'aria-label': volume ? t('mute') : t('unmute'),
+            title: volume ? t('mute') : t('unmute'),
+            onClick: () => engine.setVolume(volume ? 0 : 80),
+            children: jsx(volume ? icons.Volume2 : icons.VolumeX, { size: 11, 'aria-hidden': true })
+          }),
           jsx('input', {
             type: 'range',
             min: 0,
@@ -969,6 +1010,8 @@ const LOCALES = {
     name: 'Sound name',
     delete: 'Delete',
     volume: 'Volume',
+    mute: 'Mute',
+    unmute: 'Unmute',
     showLabel: 'Show the Soundboard label in the status bar',
     empty: 'No sounds yet. Add an audio file, or drop one here.',
     restore: 'Restore built-in sounds',
@@ -993,6 +1036,8 @@ const LOCALES = {
     name: 'Nazwa dźwięku',
     delete: 'Usuń',
     volume: 'Głośność',
+    mute: 'Wycisz',
+    unmute: 'Wyłącz wyciszenie',
     showLabel: 'Pokazuj podpis Soundboard na pasku stanu',
     empty: 'Brak dźwięków. Dodaj plik audio albo przeciągnij go tutaj.',
     restore: 'Przywróć dźwięki wbudowane',

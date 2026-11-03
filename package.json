@@ -14,11 +14,14 @@
     "audio"
   ],
   "scripts": {
-    "test": "node test/harness.mjs"
+    "test": "node test/harness.mjs && node test/preview.mjs",
+    "test:unit": "node test/harness.mjs",
+    "test:ui": "node test/preview.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
     "jsdom": "^26.0.0",
+    "playwright-core": "^1.50.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   }

@@ -360,7 +360,7 @@ check('clicking the chip opens the panel', () => {
   if (!panel()) throw new Error('popover content did not mount')
 })
 
-const pads = () => [...(panel()?.querySelectorAll('.hermes-sb-pad') ?? [])]
+const pads = () => [...(panel()?.querySelectorAll('.hermes-sb-pad') ?? [])].filter(pad => pad.querySelector('.hermes-sb-pad-name'))
 check('ships the seven built-in pads', () => {
   if (pads().length !== 7) throw new Error(`expected 7 pads, got ${pads().length}`)
   const names = pads().map(pad => pad.textContent)
@@ -430,7 +430,7 @@ await waitFor(() => padByName('Clap Trap'), 'the custom pad')
 check('a dropped/added file becomes a pad', () => {
   const pad = padByName('Clap Trap')
   if (!pad) throw new Error('no pad')
-  if (!/audio|kB/.test(pad.textContent)) throw new Error('no meta on the pad')
+  if (!pad.getAttribute('data-custom')) throw new Error('custom pad not marked')
 })
 check('custom audio is written into the plugin data folder as base64', () => {
   const names = [...files.keys()]
@@ -538,7 +538,9 @@ plugin.register(reboot.ctx)
 const rebootChip = reboot.contributions.find(item => item.area === 'statusBar.right')
 const second = mount(rebootChip.render())
 click(second.host.querySelector('button'))
-const rebootPads = [...second.host.querySelectorAll('.hermes-sb-pad')].map(pad => pad.textContent)
+const rebootPads = [...second.host.querySelectorAll('.hermes-sb-pad')]
+  .filter(pad => pad.querySelector('.hermes-sb-pad-name'))
+  .map(pad => pad.textContent)
 check('state survives a disable/enable cycle', () => {
   if (rebootPads.length !== 8) throw new Error(`expected 8 pads after reload, got ${rebootPads.length}`)
   if (!rebootPads.some(text => text.includes('boop'))) throw new Error('custom pad lost')
@@ -556,7 +558,7 @@ const thirdChip = third.contributions.find(item => item.area === 'statusBar.righ
 const thirdMount = mount(thirdChip.render())
 check('corrupt storage falls back to the built-ins', () => {
   click(thirdMount.host.querySelector('button'))
-  const count = thirdMount.host.querySelectorAll('.hermes-sb-pad').length
+  const count = thirdMount.host.querySelectorAll('.hermes-sb-pad .hermes-sb-pad-name').length
   if (count !== 7) throw new Error(`expected 7 fallback pads, got ${count}`)
 })
 third.dispose()

@@ -103,8 +103,44 @@ export const PopoverContent = ({ children, ...props }) => {
   return open ? createElement('div', { 'data-popover-content': 'true', ...props }, children) : null
 }
 
+// A visible stand-in for each icon the plugin uses, so the preview shows what
+// the real SVG would occupy. The real host renders actual SVGs.
+const GLYPH = {
+  Plus: '+',
+  StopFilled: '■',
+  Pencil: '✎',
+  Play: '▶',
+  Trash2: '✕',
+  Loader2: '◌',
+  Volume2: '🔊',
+  VolumeX: '🔇',
+  AudioLines: '≋',
+  Pause: '❙❙',
+  X: '✕'
+}
+
 const icon = name => {
-  const Component = props => createElement('span', { 'data-icon': name, ...props })
+  const Component = props => {
+    const size = props.size ?? 12
+    return createElement(
+      'span',
+      {
+        'data-icon': name,
+        'aria-hidden': 'true',
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: size,
+          height: size,
+          fontSize: Math.max(8, size - 1),
+          lineHeight: 1,
+          flexShrink: 0
+        }
+      },
+      GLYPH[name] ?? '◆'
+    )
+  }
   Component.displayName = `icon:${name}`
   return Component
 }
