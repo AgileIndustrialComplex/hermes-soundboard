@@ -739,6 +739,7 @@ check('Escape closes the panel', () => {
 // jsdom reports a Linux UA; the plugin's job pipeline is written for Windows
 // (cmd, start /b, doubled %). Force that branch for these tests.
 globalThis.__hermesForceWindows = true
+globalThis.__hermesTestSessionId = 'test-session'
 const storageBeforeYt = new Map(storage)
 const filesBeforeYt = new Map(files)
 // Each scenario below needs a fresh tool probe.
@@ -788,6 +789,22 @@ check('a non-YouTube link is refused before any process runs', () => {
   if (!note) throw new Error('no error shown')
   if (shellCalls !== 0) throw new Error(`the shell ran ${shellCalls} times`)
 })
+
+// --- no open chat: refused before any process runs, and said plainly ---
+resetTools()
+globalThis.__hermesTestSessionId = null
+shellCalls = 0
+typeInto(urlInput(), 'https://youtu.be/jNQXAC9IVRw')
+click(goButton())
+await new Promise(resolve => setTimeout(resolve, 120))
+check('an import with no open chat explains itself', () => {
+  const note = ytMount.host.querySelector('.hermes-sb-yt-note[data-error="true"]')
+  if (!note) throw new Error('no error shown')
+  if (!/open a chat/i.test(note.textContent)) throw new Error(`note=${note.textContent}`)
+  if (/invalid_params/.test(note.textContent)) throw new Error('a raw gateway code leaked to the UI')
+  if (shellCalls !== 0) throw new Error(`the shell ran ${shellCalls} times`)
+})
+globalThis.__hermesTestSessionId = 'test-session'
 
 // --- a missing tool explains itself ---
 resetTools()

@@ -65,6 +65,10 @@ Paste a link, get a pad. The link button in the panel header opens a one-field
 row; Enter or the arrow button starts the conversion, and the pad appears when
 it finishes — typically a few seconds for a short clip.
 
+- **An open chat is required.** `shell.exec` is session-bound: the gateway runs
+  the command in the focused chat's cwd under that session's policy, and refuses
+  with `invalid_params` if the call names no live session. So the import needs a
+  chat open, and says so plainly instead of surfacing that code.
 - **What it needs.** `yt-dlp` and `ffmpeg`. yt-dlp is fetched on demand by
   `uvx`, which ships with Hermes, so in practice only **ffmpeg** has to be on
   `PATH`. Both are probed before the field is offered, and a missing one is

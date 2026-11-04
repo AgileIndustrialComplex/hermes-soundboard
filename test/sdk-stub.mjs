@@ -61,7 +61,15 @@ export const cn = (...values) => values.flat().filter(Boolean).join(' ')
 export const haptic = () => {}
 
 export const host = {
-  state: { gateway: atom('open'), busy: atom(false), profile: atom('default') },
+  state: {
+    gateway: atom('open'),
+    busy: atom(false),
+    profile: atom('default'),
+    // `shell.exec` is session-bound (the gateway runs the command in that
+    // chat's cwd/policy). The harness sets this to stand in for an open chat;
+    // read through the global so it can change per scenario.
+    activeSessionId: { get: () => globalThis.__hermesTestSessionId ?? null }
+  },
   notify: () => {},
   navigate: () => {},
   // The gateway RPC door. esbuild INLINES this stub into the bundle, so the

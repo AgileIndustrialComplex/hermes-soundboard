@@ -43,6 +43,8 @@ import { jsx } from 'react/jsx-runtime'
 import plugin from ${JSON.stringify(path.join(root, 'plugin.js').replace(/\\/g, '/'))}
 import { registerPluginI18n } from ${JSON.stringify(path.join(here, 'sdk-stub.mjs').replace(/\\/g, '/'))}
 
+// shell.exec is session-bound; stand in for an open chat.
+window.__hermesTestSessionId = 'preview-session'
 const memory = new Map()
 // The plugin's data folder, emulated: path -> text/marker.
 window.__files = new Map()

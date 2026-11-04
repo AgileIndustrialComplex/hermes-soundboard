@@ -467,9 +467,32 @@ async function probeTools() {
 }
 
 /** Run one command through the gateway's shell door. Returns captured stdout
- *  when `capture` is set, else a boolean "it launched". */
+ *  when `capture` is set, else a boolean "it launched".
+ *
+ *  `shell.exec` is SESSION-BOUND: the gateway's handler refuses with
+ *  `invalid_params` unless the call carries a `session_id` naming a live local
+ *  chat, because it runs the command in that session's frozen cwd behind the
+ *  same policy as a user's `!cmd`. Omitting it was the whole bug — the RPC layer
+ *  rejected the call before any command ran, and the raw code surfaced in the
+ *  panel. There is no session-less variant to fall back to, so the focused
+ *  chat's runtime id is the door, and "no chat open" is reported as such
+ *  instead of as a converter failure. */
+function activeSessionId() {
+  try {
+    return host.state?.activeSessionId?.get?.() ?? null
+  } catch {
+    return null
+  }
+}
+
 async function runShell(command, { capture = false } = {}) {
-  const result = await host.request('shell.exec', { command })
+  const sessionId = activeSessionId()
+  // Defensive only: importYoutube checks this first so the user gets a
+  // localised message. Reaching here without a session means it appeared to
+  // have one and then lost it.
+  if (!sessionId) throw new ImportError('noSession', 'Open a chat first — the converter runs inside a session.')
+
+  const result = await host.request('shell.exec', { command, session_id: sessionId })
   const stdout = result?.stdout ?? ''
   const code = result?.code ?? 0
   return capture ? stdout : code === 0 || Boolean(stdout)
@@ -882,6 +905,10 @@ function createEngine(ctx) {
     if (!files) throw new ImportError('noFileAccess', t('noFileAccess'))
     const videoId = parseYoutube(input)
     if (!videoId) throw new ImportError('badUrl', t('ytBadUrl'))
+    // `shell.exec` runs inside a live local chat (its cwd and policy come from
+    // that session), so there is nothing to run in without one. Say so plainly
+    // rather than surfacing the gateway's `invalid_params`.
+    if (!activeSessionId()) throw new ImportError('noSession', t('ytNoSession'))
     if (sounds.get().length >= MAX_SOUNDS) throw new ImportError('tooMany', t('tooMany'))
 
     const dir = await dataDir()
@@ -1251,11 +1278,28 @@ const CSS = `
   border:1px solid var(--ui-stroke-secondary);outline:none}
 .hermes-sb-yt-input:focus{border-color:var(--ui-accent)}
 .hermes-sb-yt-input:disabled{opacity:.6}
+/* The submit button is a CONTROL, not a call to action: it sits inside a row of
+   quiet header buttons and a bordered field, so a solid accent block read as a
+   stray yellow square. It now uses the same shape as its neighbours — bordered,
+   tertiary fill, secondary glyph — and only the accent BORDER marks it as the
+   one that commits, which is how the trigger picker already signals state. */
 .hermes-sb-yt-go{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex-shrink:0;
-  border-radius:4px;color:var(--ui-bg-primary);background-color:var(--ui-accent)}
-.hermes-sb-yt-go:disabled{opacity:.45;cursor:default}
-.hermes-sb-yt-note{padding:4px 2px 0;font-size:9px;line-height:12px;color:var(--ui-text-quaternary)}
-.hermes-sb-yt-note[data-error=true]{color:var(--ui-text-secondary)}
+  border-radius:4px;color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-yt-go:hover{border-color:var(--ui-accent);color:var(--ui-text-primary)}
+.hermes-sb-yt-go:active{background-color:var(--chrome-action-hover)}
+.hermes-sb-yt-go:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
+.hermes-sb-yt-go:disabled{opacity:.45;cursor:default;border-color:var(--ui-stroke-tertiary);color:var(--ui-text-quaternary)}
+.hermes-sb-yt-go:disabled:hover{border-color:var(--ui-stroke-tertiary);color:var(--ui-text-quaternary)}
+.hermes-sb-yt-note{padding:5px 2px 0;font-size:10px;line-height:14px;color:var(--ui-text-tertiary)}
+/* An error is the one thing in this row the user MUST read, so it gets normal
+   secondary text, a warning glyph via the marker, and a wrapped line — not the
+   dimmest 9px tone it used to have. */
+.hermes-sb-yt-note[data-error=true]{color:var(--ui-text-secondary);padding-left:12px;position:relative}
+.hermes-sb-yt-note[data-error=true]::before{content:"!";position:absolute;left:2px;top:5px;
+  width:8px;height:8px;border-radius:50%;text-align:center;
+  font-size:7px;line-height:8px;font-weight:700;
+  color:var(--ui-bg-primary);background-color:var(--ui-text-tertiary)}
 .hermes-sb-body{position:relative}
 `
 
@@ -1963,6 +2007,7 @@ const LOCALES = {
     ytNoYtdlp: 'yt-dlp is not available. Install uv (it is bundled with Hermes) and try again.',
     ytNoFfmpeg: 'ffmpeg was not found on PATH — yt-dlp needs it to make an mp3.',
     ytNoShell: 'Hermes refused to run the converter.',
+    ytNoSession: 'Open a chat first — the converter runs inside the session that is currently open.',
     ytTooLong: 'That video is {secs}s long. Soundboard clips are capped at 30s — pick a shorter one.',
     ytTimeout: 'The conversion did not finish in three minutes.',
     ytFailed: 'The conversion failed.',
@@ -2007,6 +2052,7 @@ const LOCALES = {
     ytNoYtdlp: 'yt-dlp jest niedostępny. Zainstaluj uv (jest w zestawie z Hermes) i spróbuj ponownie.',
     ytNoFfmpeg: 'Nie znaleziono ffmpeg w PATH — yt-dlp potrzebuje go do mp3.',
     ytNoShell: 'Hermes odmówił uruchomienia konwertera.',
+    ytNoSession: 'Najpierw otwórz czat — konwerter działa w obrębie otwartej sesji.',
     ytTooLong: 'Ten film ma {secs}s. Klipy dźwiękowe są ograniczone do 30s — wybierz krótszy.',
     ytTimeout: 'Konwersja nie zakończyła się w trzy minuty.',
     ytFailed: 'Konwersja nie powiodła się.',
