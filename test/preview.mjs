@@ -150,7 +150,14 @@ const THEME = `
      placement — pinned to the window's bottom-right like the real thing. */
   .hermes-sb-panel{position:fixed;right:8px;bottom:28px;width:308px;background:var(--ui-bg-elevated);
     border:1px solid var(--ui-stroke-secondary);border-radius:8px;padding:8px;
-    box-shadow:0 10px 32px #0009;z-index:10}
+    box-shadow:0 10px 32px #0009;z-index:10;
+    /* The real PopoverContent carries backdrop-blur-md. A backdrop-filter makes
+       this element the CONTAINING BLOCK for position:fixed descendants, so any
+       fixed-positioned child anchors here instead of the viewport. Reproducing
+       it in the stub is what makes this harness able to catch that class of bug
+       — without it a fixed menu measured correctly here and rendered off-screen
+       in the app. */
+    backdrop-filter:blur(12px)}
   svg{width:1em;height:1em;display:block}
   button{font:inherit;border:0;background:none;cursor:pointer;padding:0;color:inherit}
   input{font:inherit}
@@ -347,6 +354,12 @@ const menu = await page.evaluate(() => {
   const r = node.getBoundingClientRect()
   return {
     rows: node.querySelectorAll('.hermes-sb-menu-row').length,
+    headings: [...node.querySelectorAll('.hermes-sb-menu-heading')].map(h => ({
+      text: h.textContent.trim(),
+      h: Math.round(h.getBoundingClientRect().height),
+      w: Math.round(h.getBoundingClientRect().width),
+      fontSize: getComputedStyle(h).fontSize
+    })),
     groups: node.querySelectorAll('.hermes-sb-menu-group').length,
     background: style.backgroundColor,
     border: style.borderColor,
@@ -372,6 +385,7 @@ const menuRatio = contrastOn(menu.row.color, menu.background)
 const headingRatio = contrastOn(menu.heading.color, menu.background)
 console.log(`  menu bg ${menu.background} (${menu.box.w}x${menu.box.h} @ ${menu.box.x},${menu.box.y})`)
 console.log(`  ${menu.rows} rows in ${menu.groups} groups`)
+console.log(`  headings: ${JSON.stringify(menu.headings)}`)
 console.log(`  row text ${menu.row.color} → ${menuRatio?.toFixed(2)}:1 on the menu surface`)
 console.log(`  group label ${menu.heading.color} → ${headingRatio?.toFixed(2)}:1`)
 if (!/^rgb/.test(menu.background) || menu.background.includes('rgba(0, 0, 0, 0)')) console.log('!! the menu has no opaque background')
@@ -379,6 +393,20 @@ if (menuRatio !== null && menuRatio < 4.5) console.log(`!! menu row text fails 4
 if (headingRatio !== null && headingRatio < 3) console.log(`!! group label fails 3:1 (${headingRatio.toFixed(2)})`)
 if (menu.rows < 15) console.log(`!! only ${menu.rows} trigger rows`)
 if (menu.box.y + menu.box.h > 560) console.log('!! the menu runs off the bottom of the viewport')
+// The menu must be INSIDE the panel and on screen. A fixed-positioned menu
+// anchored to a backdrop-filtered popover still reports a plausible width, so
+// check containment in the panel's own box — this is what catches that bug.
+const hostBox = await page.$eval('.hermes-sb-panel', node => {
+  const r = node.getBoundingClientRect()
+  return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }
+})
+const escaped =
+  menu.box.x < hostBox.x - 1 ||
+  menu.box.x + menu.box.w > hostBox.x + hostBox.w + 1 ||
+  menu.box.y < hostBox.y - 1
+console.log(`  menu inside the panel (${hostBox.x},${hostBox.y} ${hostBox.w}x${hostBox.h}): ${!escaped}`)
+if (escaped) console.log('!! the menu escapes the panel box — it is being re-anchored by an ancestor (backdrop-filter / transform)')
+if (menu.box.w < 200) console.log(`!! the menu is only ${menu.box.w}px wide — it is confined to the picker's box, not the row's`)
 await shot('preview-menu.png')
 
 // Pick one from the open menu.

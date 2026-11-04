@@ -794,7 +794,7 @@ const CSS = `
 .hermes-sb-add:disabled{opacity:.5;cursor:default}
 .hermes-sb-empty{padding:18px 8px;text-align:center;font-size:11px;line-height:16px;color:var(--ui-text-tertiary)}
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
-.hermes-sb-row{display:flex;align-items:center;gap:4px}
+.hermes-sb-row{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
 .hermes-sb-row .hermes-sb-row-name{flex:1;min-width:0;font-size:11px}
 /* The trigger picker is a button + an in-DOM menu, NOT a native <select>.
    A native option list is a browser-drawn popup coloured from the page's
@@ -802,8 +802,12 @@ const CSS = `
    under cream text (~1.1:1) and no page CSS could reach it. Owning the list
    means owning its background — the menu paints on --ui-bg-elevated with
    primary text, and the panel's own popover is opaque enough to sit behind it. */
-.hermes-sb-when{flex:0 0 124px;min-width:0;display:flex;align-items:center;height:22px;position:relative}
-.hermes-sb-picker{width:100%;height:21px;box-sizing:border-box;margin:0;display:flex;align-items:center;gap:2px;
+/* The wrapper DISSOLVES (display: contents) so the picker and the menu become
+   direct children of the row's flex layout. Without it the wrapper is a
+   124x22 box and the menu, however wide it is told to be, can only render
+   inside that box — which is why it came out 124px wide and unreadable. */
+.hermes-sb-when{display:contents}
+.hermes-sb-picker{flex:0 0 124px;width:124px;height:21px;box-sizing:border-box;margin:0;display:flex;align-items:center;gap:2px;
   padding:0 4px;border-radius:3px;text-align:left;
   font-size:10px;line-height:13px;color:var(--ui-text-secondary);
   background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary);outline:none}
@@ -817,14 +821,16 @@ const CSS = `
 .hermes-sb-picker[data-open=true] .hermes-sb-picker-caret{transform:rotate(180deg)}
 /* Opaque, themed, and layered above the row it belongs to. max-height keeps a
    14-row grouped list inside a popover that is already near the viewport top. */
-.hermes-sb-menu{position:fixed;z-index:20;width:186px;
+/* The menu is a normal flex item that wraps onto its own line: the row is
+   flex-wrap: wrap and this is flex: 0 0 100%. Deliberately NOT positioned —
+   absolute got clipped by the manage list's scroll container, and fixed
+   re-anchored to the popover (whose backdrop-filter makes it the containing
+   block), which is why the picker looked dead in the app while passing tests. */
+.hermes-sb-menu{flex:0 0 100%;width:100%;margin-top:2px;
   max-height:238px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;
   padding:3px;border-radius:5px;
   background-color:var(--ui-bg-elevated);border:1px solid var(--ui-stroke-secondary);
   box-shadow:0 10px 26px rgba(0,0,0,.55)}
-/* Fixed positioning to escape the manage list's own scroll container; the
-   upward variant is anchored by its bottom edge, 2px above the trigger. */
-.hermes-sb-menu[data-drop=up]{transform:translateY(-100%)}
 .hermes-sb-menu-group{display:flex;flex-direction:column}
 .hermes-sb-menu-heading{padding:5px 6px 2px;font-size:9px;line-height:11px;font-weight:600;
   letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-tertiary);background-color:var(--ui-bg-elevated)}
@@ -895,7 +901,6 @@ function Pad({ sound, index, engine }) {
 function TriggerSelect({ sound, engine }) {
   const t = usePluginI18n(ID)
   const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState(null)
   const [cursor, setCursor] = useState(-1)
   const boxRef = useRef(null)
   const current = sound.trigger ? TRIGGER_BY_ID.get(sound.trigger) : null
@@ -907,35 +912,11 @@ function TriggerSelect({ sound, engine }) {
   useEffect(() => {
     if (!open) return
     const onDown = event => {
-      if (!boxRef.current?.contains(event.target) && !event.target.closest?.('.hermes-sb-menu')) setOpen(false)
+      if (!boxRef.current?.contains(event.target)) setOpen(false)
     }
-    const onScroll = () => setOpen(false)
     document.addEventListener('mousedown', onDown)
-    window.addEventListener('resize', onScroll)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      window.removeEventListener('resize', onScroll)
-    }
+    return () => document.removeEventListener('mousedown', onDown)
   }, [open])
-
-  const toggle = () => {
-    haptic('tap')
-    if (open) {
-      setOpen(false)
-      return
-    }
-    const rect = boxRef.current?.getBoundingClientRect()
-    if (!rect) return
-    // `position: fixed` so the manage list's own `overflow-y: auto` cannot clip
-    // the menu, and the coordinates are viewport-relative because of it.
-    // Above the trigger when there is not enough room beneath (the panel sits
-    // just above the status bar, so its lower rows have almost none).
-    const below = window.innerHeight - rect.bottom
-    const up = below < 250 && rect.top > below
-    setPos({ left: Math.round(rect.left), top: Math.round(up ? rect.top - 2 : rect.bottom + 2), up })
-    setCursor(Math.max(0, flat.findIndex(row => row.id === (sound.trigger ?? ''))))
-    setOpen(true)
-  }
 
   const pick = id => {
     engine.bind(sound.id, id)
@@ -953,7 +934,8 @@ function TriggerSelect({ sound, engine }) {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault()
         event.stopPropagation()
-        toggle()
+        setOpen(true)
+        setCursor(Math.max(0, flat.findIndex(row => row.id === (sound.trigger ?? ''))))
       }
       return
     }
@@ -973,6 +955,16 @@ function TriggerSelect({ sound, engine }) {
 
   let rowIndex = -1
 
+  // THE LIST IS IN FLOW, not positioned. Two separate attempts to float it
+  // failed against the real app while passing every test:
+  //   - `position: absolute` was clipped by the manage list's `overflow-y:auto`;
+  //   - `position: fixed` anchored to the POPOVER, not the viewport, because
+  //     PopoverContent carries `backdrop-blur-md` and a backdrop-filter makes an
+  //     element the containing block for fixed children — the menu then landed
+  //     far off-screen and the picker appeared dead.
+  // A wrapper with `display: contents` dissolves into the row's flex layout, so
+  // the picker sits in its cell and the menu — `flex: 0 0 100%` — wraps onto its
+  // own full-width line beneath. Nothing to clip, nothing to re-anchor.
   return jsxs('div', {
     ref: boxRef,
     className: 'hermes-sb-when',
@@ -987,18 +979,19 @@ function TriggerSelect({ sound, engine }) {
         'aria-expanded': open,
         'aria-label': `${t('when')}: ${sound.name}`,
         title: current ? current.detail : t('whenNever'),
-        onClick: toggle,
+        onClick: () => {
+          haptic('tap')
+          setOpen(value => !value)
+        },
         children: [
           jsx('span', { className: 'hermes-sb-picker-label', children: current ? current.label : t('whenNever') }),
           jsx('span', { className: 'hermes-sb-picker-caret', 'aria-hidden': true })
         ]
       }),
 
-      open && pos
+      open
         ? jsx('div', {
             className: 'hermes-sb-menu',
-            'data-drop': pos.up ? 'up' : 'down',
-            style: { left: pos.left, top: pos.top },
             role: 'listbox',
             'aria-label': t('when'),
             children: [

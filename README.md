@@ -92,10 +92,26 @@ full set is the generated `GATEWAY_EVENT_TYPES` in
 near-white sheet under this theme's cream text — roughly 1.1:1, unreadable. A
 native option list is not a DOM node: the browser draws it from the page's
 `color-scheme`, so no page CSS can restyle it. The picker is now a button plus
-an in-DOM list, which means every pixel of the menu is ours, it inherits the
-theme, it escapes the manage list's scroll container (`position: fixed`), and it
-can be measured and screenshotted by the test suite — the menu asserts at
-**8.12:1** for its rows and **4.80:1** for group headers.
+an in-DOM list, so every pixel of the menu is ours and it inherits the theme.
+Rows assert at **8.12:1** and group headers at **4.80:1**.
+
+**Why the menu is in flow, not positioned.** Three attempts, three failures, and
+the last two were only visible in the real app:
+
+| Approach | What happened |
+|---|---|
+| `position: absolute` | Clipped by the manage list's `overflow-y: auto` |
+| `position: fixed` | Anchored to the *popover*, not the viewport — `PopoverContent` carries `backdrop-blur-md`, and a backdrop-filter makes that element the containing block for fixed descendants. The menu rendered far off-screen; the picker looked dead |
+| in flow (`flex: 0 0 100%` on a wrapping row) | Correct |
+
+The wrapper carries `display: contents` so the picker and menu become direct
+children of the row's flex layout; the menu then wraps onto its own full-width
+line beneath the row. Nothing to clip, nothing to re-anchor.
+
+That lesson is now enforced by the harness: the stub popover mirrors the real
+one's `backdrop-filter`, and the suite asserts the menu is inside the panel box
+and at least 200px wide. Both assertions were verified to fail on a
+deliberately reverted build.
 
 **On autoplay.** A triggered sound plays while the window may be unfocused, so
 the WebAudio context can be suspended by the browser's autoplay policy. Every
