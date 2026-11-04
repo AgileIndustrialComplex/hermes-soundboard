@@ -503,29 +503,34 @@ async function runShell(command, { capture = false } = {}) {
  * `shell.exec` takes one string with `shell=True`, so an argument list has to
  * survive two levels of quoting (the shell, then cmd's own `start`), and the
  * first attempt at that produced `cmd /c "uvx yt-dlp "-x" …` where the inner
- * quotes closed the outer — the job never started and the failure was silent
- * because it happened before any output existed. Writing the steps to a script
- * in the plugin's own folder means the only command the shell sees is
- * `run this one file`, and every argument inside it is quoted once.
+ * quotes closed the outer — the job never started.
  *
- * Returns the script body. `status` is written last either way, so its
- * presence always means "finished", and its content says which way.
+ * Every path inside the script is RELATIVE, anchored by `%~dp0` (the script's
+ * own folder, which is the plugin's data folder). That is not tidiness: batch
+ * needs `%%` for a literal `%`, so any env-var path like `%APPDATA%` written
+ * through the same escaper became the literal text `%%APPDATA%%` — the script
+ * then could not `cd` anywhere, exited 0, wrote no status file, and the poll
+ * loop waited FOREVER on a job that had already died. Keeping the argument list
+ * relative leaves `%` doubling needed only for yt-dlp's own `%(ext)s` template.
  */
 function jobScript({ exe, args, out, log, status, mp3 }) {
-  // `%` is a batch metacharacter. yt-dlp's output template is `%(ext)s`, so an
-  // unescaped path makes cmd fail to parse the WHOLE script — it reports
-  // "File Not Found" and never runs a line, which is indistinguishable from a
-  // bad URL from the plugin's side. Doubling is the batch escape.
-  const q = value => `"${String(value).replace(/"/g, '').replace(/%/g, '%%')}"`
+  // Double the percent for batch — yt-dlp's template is `%(ext)s`, and cmd
+  // refuses to parse the WHOLE file on a lone one ("File Not Found", zero lines
+  // run). Quotes are stripped, never escaped: a path never legitimately holds
+  // one, and escaping invites breakout.
+  const q = value =>
+    `"${String(value).replace(/"/g, '').replace(/%(?![%~])/g, '%%')}"`
   const run = [exe, ...args.map(q)].join(' ')
   const lines = [
     '@echo off',
     'setlocal',
-    // Nothing here prompts; a hidden child must never wait on a console.
-    `cd /d ${q(out)}`,
+    // %~dp0 is this script's own folder, with a trailing backslash.
+    `cd /d ${q(out ?? '%~dp0')}`,
     `rem ${run}`,
     `${run} > ${q(log)} 2>&1`,
     'set "RC=%ERRORLEVEL%"',
+    // Written in EVERY case, including a failed cd: a status file is the only
+    // way the plugin learns the job ended at all.
     `if exist ${q(mp3)} (echo ok> ${q(status)}) else (echo fail> ${q(status)})`,
     'endlocal',
     'exit /b %RC%'
@@ -560,8 +565,15 @@ async function probeDuration(videoId) {
   return Number.isFinite(seconds) && seconds > 0 ? seconds : null
 }
 
-/** Watch for the job's status file: 'ok' | 'fail' | 'timeout'. */
-async function waitForStatus(files, statusPath, budgetMs) {
+/** Watch for the job's status file: 'ok' | 'fail' | 'timeout'.
+ *
+ * The status file is written once, at the END, so a job that never starts and a
+ * job that is merely slow look identical from here — which is exactly how a
+ * broken script became "waited a few minutes, nothing happened". So the log is
+ * read as the job runs: yt-dlp prints `[download]  42.3% of …`, and that is
+ * surfaced as real progress. A job that dies before writing anything still ends
+ * quietly, so the caller's budget is what turns that into a visible failure. */
+async function waitForStatus(files, statusPath, budgetMs, { logPath, onProgress } = {}) {
   const until = Date.now() + budgetMs
   while (Date.now() < until) {
     await sleep(YT_POLL_MS)
@@ -569,6 +581,17 @@ async function waitForStatus(files, statusPath, budgetMs) {
     if (read.ok) {
       const text = (read.text || '').trim()
       if (text) return text === 'ok' ? 'ok' : 'fail'
+    }
+    if (logPath && onProgress) {
+      const log = await files.readText(files.dataFolder, logPath)
+      if (log.ok) {
+        // Take the LAST percentage, not the first: the log grows.
+        const matches = String(log.text || '').match(/(\d{1,3}(?:\.\d+)?)%/g)
+        if (matches?.length) {
+          const percent = Number(matches[matches.length - 1].replace('%', ''))
+          if (Number.isFinite(percent)) onProgress(Math.max(0, Math.min(100, Math.round(percent))))
+        }
+      }
     }
   }
   return 'timeout'
@@ -725,6 +748,8 @@ function createEngine(ctx) {
   const saving = atom(false)
   /** The most recent trigger that actually fired, for the panel's readout. */
   const lastTrigger = atom(null)
+  /** Live YouTube job state: null or {stage, id, percent, at}. */
+  const ytJob = atom(null)
 
   // pad id -> its one pending flash timer.
   const timers = new Map()
@@ -945,18 +970,20 @@ function createEngine(ctx) {
       '--audio-format', 'mp3',
       '--audio-quality', '5',
       '--no-playlist',
-      '-o', `${joinNative(dir, stem)}.%(ext)s`,
+      '-o', `${stem}.%(ext)s`,
       `https://www.youtube.com/watch?v=${videoId}`
     ]
 
     const scriptPath = `.${stem}.cmd`
+    // Relative names only — see jobScript. The script anchors to its own folder,
+    // so nothing here needs an absolute path or an env var.
     const script = jobScript({
       exe: 'uvx yt-dlp',
       args,
-      out: dir,
-      log: joinNative(dir, logPath),
-      status: joinNative(dir, statusPath),
-      mp3: joinNative(dir, mp3Path)
+      out: '%~dp0',
+      log: `.${stem}.log`,
+      status: `.${stem}.status`,
+      mp3: `${stem}.mp3`
     })
     const wroteScript = await files.writeText(files.dataFolder, scriptPath, script)
     if (!wroteScript.ok) throw new ImportError('failed', wroteScript.message || t('saveFailed'))
@@ -965,8 +992,21 @@ function createEngine(ctx) {
     const started = await runShell(detachedCommand(joinNative(dir, scriptPath)))
     if (!started) throw new ImportError('noShell', t('ytNoShell'))
 
-    const outcome = await waitForStatus(files, statusPath, YT_TIMEOUT_MS)
-    if (outcome === 'timeout') throw new ImportError('timeout', t('ytTimeout'))
+    // Publish progress while the job runs: the panel renders this, so a long
+    // download shows movement instead of looking dead.
+    ytJob.set({ stage: 'downloading', id, percent: 0, at: Date.now() })
+    const outcome = await waitForStatus(files, statusPath, YT_TIMEOUT_MS, {
+      files,
+      logPath,
+      onProgress: percent => ytJob.set({ stage: 'downloading', id, percent, at: Date.now() })
+    })
+    if (outcome === 'timeout') {
+      // A job that produced no status file at all died before its first line —
+      // say that, rather than blaming a slow conversion.
+      const detail = await readLogTail(files, logPath)
+      ytJob.set(null)
+      throw new ImportError('timeout', detail || t('ytTimeout'))
+    }
     if (outcome !== 'ok') {
       const detail = await readLogTail(files, logPath)
       throw new ImportError('failed', detail || t('ytFailed'))
@@ -1001,6 +1041,7 @@ function createEngine(ctx) {
     urls.set(id, audio.url)
     persistSounds([...sounds.get(), sound])
     onStage?.('done')
+    ytJob.set(null)
     haptic('tap')
     return sound
   }
@@ -1145,6 +1186,7 @@ function createEngine(ctx) {
     toggleTrigger,
     clearTriggers,
     importYoutube,
+    ytJob,
     notify,
     restorePresets,
     setVolume: volume => persistSettings({ volume }),
@@ -1291,6 +1333,12 @@ const CSS = `
 .hermes-sb-yt-go:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
 .hermes-sb-yt-go:disabled{opacity:.45;cursor:default;border-color:var(--ui-stroke-tertiary);color:var(--ui-text-quaternary)}
 .hermes-sb-yt-go:disabled:hover{border-color:var(--ui-stroke-tertiary);color:var(--ui-text-quaternary)}
+.hermes-sb-yt-progress{display:flex;align-items:center;gap:6px;margin-top:6px}
+.hermes-sb-yt-bar{flex:1;min-width:0;height:4px;border-radius:2px;overflow:hidden;background-color:var(--ui-bg-tertiary)}
+.hermes-sb-yt-bar-fill{height:100%;border-radius:2px;background-color:var(--ui-accent);
+  transition:width .25s ease-out}
+.hermes-sb-yt-pct{flex:0 0 auto;font-size:9px;line-height:11px;font-variant-numeric:tabular-nums;
+  color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-sb-yt-note{padding:5px 2px 0;font-size:10px;line-height:14px;color:var(--ui-text-tertiary)}
 /* An error is the one thing in this row the user MUST read, so it gets normal
    secondary text, a warning glyph via the marker, and a wrapped line — not the
@@ -1577,6 +1625,7 @@ function Panel({ engine }) {
   const settings = useValue(engine.settings)
   const saving = useValue(engine.saving)
   const last = useValue(engine.lastTrigger)
+  const ytJob = useValue(engine.ytJob)
   const [manage, setManage] = useState(false)
   const [dragging, setDragging] = useState(false)
   // YouTube import: the field is behind a button, the job is fire-and-watch.
@@ -1617,7 +1666,11 @@ function Panel({ engine }) {
       engine.notify({ kind: 'info', message: t('ytAdded').replace('{name}', sound.name) })
     } catch (error) {
       // The engine throws localised ImportErrors; anything else is shown raw.
-      setYtError(error instanceof Error ? error.message : String(error))
+      const message = error instanceof Error ? error.message : String(error)
+      setYtError(message)
+      // Also as a toast: the panel may be shut by then, and a conversion that
+      // failed silently is the thing this whole path exists to avoid.
+      engine.notify({ kind: 'error', message: `${t('ytFailed')} ${message}` })
     } finally {
       setYtBusy(false)
     }
@@ -1778,7 +1831,26 @@ function Panel({ engine }) {
           })
         : null,
 
-      ytBusy ? jsx('div', { className: 'hermes-sb-yt-note', children: t('ytWorking') }) : null,
+      ytBusy
+        ? jsxs('div', {
+            className: 'hermes-sb-yt-progress',
+            role: 'progressbar',
+            'aria-valuemin': 0,
+            'aria-valuemax': 100,
+            'aria-valuenow': ytJob?.percent ?? 0,
+            'aria-label': t('ytWorking'),
+            children: [
+              jsx('div', { className: 'hermes-sb-yt-bar', children: jsx('div', {
+                className: 'hermes-sb-yt-bar-fill',
+                style: { width: `${Math.max(4, ytJob?.percent ?? 0)}%` }
+              }) }),
+              jsx('span', {
+                className: 'hermes-sb-yt-pct',
+                children: ytJob?.percent ? `${ytJob.percent}%` : t('ytWorking')
+              })
+            ]
+          })
+        : null,
       ytError ? jsx('div', { className: 'hermes-sb-yt-note', 'data-error': 'true', children: ytError }) : null,
 
       manage
@@ -2000,7 +2072,7 @@ const LOCALES = {
     ytOpen: 'Import from YouTube',
     ytPlaceholder: 'YouTube link or video id',
     ytImport: 'Convert to mp3',
-    ytWorking: 'Downloading and converting… this can take a minute.',
+    ytWorking: 'Converting…',
     ytAdded: 'Added “{name}”.',
     ytBadUrl: 'That is not a YouTube link.',
     ytNoPath: 'This build does not expose a plugin folder, so a download has nowhere to land.',
@@ -2009,7 +2081,7 @@ const LOCALES = {
     ytNoShell: 'Hermes refused to run the converter.',
     ytNoSession: 'Open a chat first — the converter runs inside the session that is currently open.',
     ytTooLong: 'That video is {secs}s long. Soundboard clips are capped at 30s — pick a shorter one.',
-    ytTimeout: 'The conversion did not finish in three minutes.',
+    ytTimeout: 'The converter stopped without reporting back. Check that ffmpeg is on PATH, then try again.',
     ytFailed: 'The conversion failed.',
     whenClear: 'Clear all triggers',
     lastTrigger: trigger => `Last trigger: ${trigger}`,
@@ -2054,7 +2126,7 @@ const LOCALES = {
     ytNoShell: 'Hermes odmówił uruchomienia konwertera.',
     ytNoSession: 'Najpierw otwórz czat — konwerter działa w obrębie otwartej sesji.',
     ytTooLong: 'Ten film ma {secs}s. Klipy dźwiękowe są ograniczone do 30s — wybierz krótszy.',
-    ytTimeout: 'Konwersja nie zakończyła się w trzy minuty.',
+    ytTimeout: 'Konwerter zatrzymał się bez odpowiedzi. Sprawdź, czy ffmpeg jest w PATH, i spróbuj ponownie.',
     ytFailed: 'Konwersja nie powiodła się.',
     whenClear: 'Wyczyść wszystkie wyzwalacze',
     lastTrigger: trigger => `Ostatni wyzwalacz: ${trigger}`,

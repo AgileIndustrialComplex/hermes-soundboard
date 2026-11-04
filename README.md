@@ -88,13 +88,17 @@ status file. Three details are load-bearing and each was a real failure first:
 
 | Detail | Why |
 |---|---|
+| Every path is **relative**, anchored by `%~dp0` | Batch needs `%%` for a literal `%`, so an env-var path like `%APPDATA%` written through the same escaper became the literal text `%%APPDATA%%` — the script could not `cd`, exited 0, and wrote **no status file**, so the plugin waited out its whole budget on a job that had already died |
 | The script takes **no arguments** | `start /b cmd /c "script.cmd" "arg"` silently drops arguments — four forms were probed, all arrived empty. Every path is baked into the script instead |
 | `%` is **doubled** | `-o out.%(ext)s` — an unescaped `%` makes cmd refuse to parse the whole file (`File Not Found`), running no line at all |
 | Duration is probed **in the foreground** | `--match-filter "duration <= 30"` puts `<`/`>` in the command, which cmd eats as redirection even inside quotes; yt-dlp then reports "You must provide at least one URL" |
 
 The status file is the only channel back — `shell.exec` captures output at
 launch and the child is gone by then — so the job writes `ok`/`fail` when it
-finishes, and the plugin polls it.
+finishes, and the plugin polls it. Because a status file only appears at the
+END, the plugin also reads yt-dlp's log as the job runs and turns its
+`[download] 42.3%` lines into the progress bar. Every failure path raises a host
+toast as well as the inline note, since the panel is often shut by then.
 
 ## Triggers
 
@@ -177,6 +181,8 @@ the cue is never silently lost.
 ![Two triggers on one pad](shots/preview-multi.png)
 
 ![Importing from YouTube](shots/preview-youtube.png)
+
+![Converting, with progress](shots/preview-youtube-progress.png)
 
 | | |
 |---|---|

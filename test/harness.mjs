@@ -869,6 +869,18 @@ check('a valid link writes a job script, runs it, and lands a pad', () => {
   if (yt.mime !== 'audio/mpeg') throw new Error(`mime=${yt.mime}`)
 })
 
+check('the progress bar is gone once the import finishes', () => {
+  // A bar stuck at 100% would be as confusing as no bar at all.
+  if (ytMount.host.querySelector('.hermes-sb-yt-progress')) throw new Error('the progress bar survived')
+})
+
+check('a failure raises a host toast as well as the inline note', () => {
+  // The panel can be shut when a job ends, so the toast is the only signal left.
+  if (!notifications.length) throw new Error('no toast was raised')
+  const last = notifications[notifications.length - 1]
+  if (last.kind !== 'info') throw new Error(`kind=${last.kind}`)
+})
+
 check('the job leftovers are cleaned up after a success', () => {
   const leftovers = ytFiles().filter(name => /\.(cmd|log|status)$/.test(name))
   if (leftovers.length) throw new Error(`left behind: ${leftovers.join(', ')}`)

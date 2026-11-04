@@ -71,55 +71,67 @@ check('an over-long id is refused', () => eq(parseYoutube('https://youtu.be/jNQX
 check('a channel URL is refused', () => eq(parseYoutube('https://www.youtube.com/@someone'), null))
 
 // ── the job script ──────────────────────────────────────────────────────
-const D = 'C:\\data dir'
 const script = jobScript({
   exe: 'uvx yt-dlp',
-  args: ['-x', '--audio-format', 'mp3', '-o', `${D}\\yt-1.%(ext)s`, 'https://www.youtube.com/watch?v=jNQXAC9IVRw'],
-  out: D,
-  log: `${D}\\.yt-1.log`,
-  status: `${D}\\.yt-1.status`,
-  mp3: `${D}\\yt-1.mp3`
+  args: ['-x', '--audio-format', 'mp3', '-o', 'yt-1.%(ext)s', 'https://www.youtube.com/watch?v=jNQXAC9IVRw'],
+  out: '%~dp0',
+  log: '.yt-1.log',
+  status: '.yt-1.status',
+  mp3: 'yt-1.mp3'
 })
 
-check('the script cds into the data folder first', () => {
+check('the script anchors to its own folder', () => {
   const first = script.split('\r\n').find(line => /^cd /.test(line))
-  if (first !== `cd /d "${D}"`) throw new Error(first)
+  if (first !== 'cd /d "%~dp0"') throw new Error(first)
+})
+check('no path carries an env var that batch would mangle', () => {
+  // `%APPDATA%` run through the percent escaper became the LITERAL `%%APPDATA%%`,
+  // so `cd` failed, the script exited 0 and wrote no status file — the plugin
+  // then waited forever on a job that had already died.
+  if (/%APPDATA%/i.test(script)) throw new Error('an env var leaked into the script')
+  if (/%%[A-Z]/.test(script)) throw new Error('a double-escaped variable name')
 })
 check('it runs yt-dlp through uvx', () => {
   if (!script.includes('uvx yt-dlp "-x" "--audio-format" "mp3"')) throw new Error(script)
 })
-check('a path containing a space stays quoted', () => {
-  if (!script.includes(`"${D}\\yt-1.%%(ext)s"`)) throw new Error(script)
-})
-check('a percent in the output template is DOUBLED', () => {
-  // Unescaped, cmd fails to parse the whole file and reports "File Not Found"
-  // without running a line — the bug that made every import fail silently.
-  // Every % in a path must be doubled; a lone one is the bug.
-  // Scope to the -o argument: batch variables like %ERRORLEVEL% are fine.
+check('the output template is escaped exactly once', () => {
   const template = script.match(/"-o" "([^"]+)"/)
-  if (!template) throw new Error('no -o argument in the script')
-  if (/(?<!%)%(?!%)/.test(template[1])) throw new Error(`unescaped % in the output template: ${template[1]}`)
-  // ...except in %ERRORLEVEL%, which is a real batch variable.
-  if (!script.includes('%%(ext)s')) throw new Error(script)
+  if (!template) throw new Error('no -o argument')
+  if (template[1] !== 'yt-1.%%(ext)s') throw new Error(`template is ${template[1]}`)
+})
+check('every percent in an argument is doubled', () => {
+  const args = [...script.matchAll(/"(-{1,2}[^"]*)"/g)]
+  for (const [, value] of args) {
+    if (/(?<!%)%(?!%)/.test(value)) throw new Error(`unescaped % in ${value}`)
+  }
 })
 check('the log gets both streams', () => {
-  const redirect = '> "C:\\data dir\\.yt-1.log" 2>&1'
-  if (!script.includes(redirect)) throw new Error(`missing ${redirect} in:\n${script}`)
+  if (!script.includes('> ".yt-1.log" 2>&1')) throw new Error(script)
 })
 check('success and failure both write the status file', () => {
-  if (!/if exist .*yt-1\.mp3.*echo ok>/.test(script)) throw new Error('no ok branch')
-  if (!/else \(echo fail>/.test(script)) throw new Error('no fail branch')
+  if (!/if exist "yt-1\.mp3" \(echo ok> "\.yt-1\.status"\)/.test(script)) throw new Error('no ok branch')
+  if (!/else \(echo fail> "\.yt-1\.status"\)/.test(script)) throw new Error('no fail branch')
+})
+check('the status branch runs even if yt-dlp never starts', () => {
+  // The `if exist` is a separate line, not chained with && or || — otherwise a
+  // failure to launch skips it and the plugin waits out its whole budget.
+  const lines = script.split('\r\n')
+  const runIdx = lines.findIndex(line => line.startsWith('uvx yt-dlp'))
+  const statusIdx = lines.findIndex(line => line.startsWith('if exist'))
+  if (statusIdx < runIdx) throw new Error('the status line precedes the command')
+  if (lines[runIdx].includes('&&') || lines[runIdx].includes('||')) throw new Error('the run line is chained')
 })
 check('the script has CRLF line endings (cmd needs them)', () => {
   if (/[^\r]\n/.test(script)) throw new Error('bare LF found')
 })
 check('an argument containing a quote cannot break out', () => {
-  const evil = jobScript({ exe: 'uvx yt-dlp', args: ['-o', 'x" & shutdown /s & "'], out: D, log: 'l', status: 's', mp3: 'm' })
+  const evil = jobScript({ exe: 'uvx yt-dlp', args: ['-o', 'x" & shutdown /s & "'], out: '%~dp0', log: 'l', status: 's', mp3: 'm' })
   if (evil.includes('"x" & shutdown')) throw new Error('quote survived')
   if (!evil.includes('"x & shutdown /s & "')) throw new Error(evil)
 })
 
 // ── the launch command ──────────────────────────────────────────────────
+const D = 'C:\\data dir'
 const launch = detachedCommand(`${D}\\.yt-1.cmd`)
 check('the launch is a single detached start', () => {
   if (launch !== `start "" /b "${D}\\.yt-1.cmd"`) throw new Error(launch)

@@ -78,19 +78,34 @@ const ctx = {
   },
   files: {
     dataFolder: 'data',
-    readText: async (_folder, path) =>
-      window.__files.has(path)
+    readText: async (_folder, path) => {
+      const job = window.__pendingJob
+      if (job && path.endsWith('.status')) {
+        job.tries += 1
+        // Complete on the third poll (~1.4s), so the bar is visible first.
+        if (job.tries >= 3) {
+          window.__files.set(job.stem + '.mp3', 'FAKE')
+          window.__pendingJob = null
+          return { ok: true, text: 'ok', size: 2, mtimeMs: 0 }
+        }
+        return { ok: false, error: 'not-found', message: 'pending' }
+      }
+      return window.__files.has(path)
         ? { ok: true, text: window.__files.get(path), size: window.__files.get(path).length, mtimeMs: 0 }
-        : { ok: false, error: 'not-found', message: 'no ' + path },
+        : { ok: false, error: 'not-found', message: 'no ' + path }
+    },
     writeText: async (_folder, path, text) => {
       window.__files.set(path, text)
       // Stand in for the detached job: as soon as the script lands, produce the
       // mp3 and the status file it would write.
       if (path.endsWith('.cmd')) {
         const stem = path.replace(/^\./, '').replace(/\.cmd$/, '')
-        window.__files.set(stem + '.mp3', 'FAKE')
-        window.__files.set(path.replace(/\.cmd$/, '.status'), 'ok')
         window.__script = text
+        // yt-dlp's real progress lines, so the poll loop has something to read.
+        window.__files.set(path.replace(/\\.cmd$/, '.log'), '[download]  37.5% of 1.0MiB' + String.fromCharCode(10))
+        // Hold the status back briefly: this is what makes the bar observable
+        // instead of a single skipped frame.
+        window.__pendingJob = { stem, tries: 0 }
       }
       return { ok: true, path, size: text.length, mtimeMs: 0 }
     },
@@ -523,6 +538,46 @@ await page.waitForTimeout(120)
 await shot('preview-youtube.png')
 
 await page.click('.hermes-sb-yt-go')
+// The bar must appear while the job runs — that is the whole point of it.
+let sawProgress = false
+let sawPercent = ''
+for (let i = 0; i < 12; i += 1) {
+  await page.waitForTimeout(180)
+  const state = await page.evaluate(() => ({
+    bar: Boolean(document.querySelector('.hermes-sb-yt-progress')),
+    pct: document.querySelector('.hermes-sb-yt-pct')?.textContent ?? ''
+  }))
+  if (state.bar) {
+    sawProgress = true
+    if (/%/.test(state.pct)) sawPercent = state.pct
+  }
+  if (sawProgress && sawPercent) {
+    // The fill animates (transition: width .25s), so measuring immediately
+    // reads a mid-flight width and reports a disagreement that is not real.
+    await page.waitForTimeout(400)
+    const geom = await page.evaluate(() => {
+      const track = document.querySelector('.hermes-sb-yt-bar')
+      const fill = document.querySelector('.hermes-sb-yt-bar-fill')
+      const t = track.getBoundingClientRect()
+      const f = fill.getBoundingClientRect()
+      return {
+        trackW: Math.round(t.width),
+        fillW: Math.round(f.width),
+        ratio: t.width ? Math.round((f.width / t.width) * 100) : 0,
+        label: document.querySelector('.hermes-sb-yt-pct')?.textContent
+      }
+    })
+    console.log(`bar geometry: fill ${geom.fillW}/${geom.trackW}px = ${geom.ratio}% (label says ${geom.label})`)
+    const want = Number((geom.label || '').replace('%', ''))
+    if (want && Math.abs(geom.ratio - want) > 8) console.log(`!! the fill (${geom.ratio}%) disagrees with the label (${want}%)`)
+    await shot('preview-youtube-progress.png')
+    break
+  }
+}
+console.log(`progress bar appeared while running: ${sawProgress}`)
+console.log(`percentage read from the log: ${sawPercent || '(never became a number)'}`)
+if (!sawProgress) console.log('!! no progress indicator while the job ran')
+if (!sawPercent) console.log('!! the bar never showed a real percentage')
 // The job poll is 700ms per tick; the stub answers on the first one.
 await page.waitForFunction(() => {
   const pads = [...document.querySelectorAll('.hermes-sb-pad-name')].map(node => node.textContent)
