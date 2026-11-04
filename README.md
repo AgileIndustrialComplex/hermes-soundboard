@@ -52,7 +52,12 @@ mode all persist per machine.
   message. Bound pads carry a dot in the grid; the panel footer names the last
   trigger that actually fired. See [Triggers](#triggers).
 - **Volume + mute.** One master volume, persisted. `■` stops everything and
-  suspends the audio context.
+  suspends the audio context. Each pad also has its own **gain trim** (0-200%,
+  stepped with −/+) for the one clip that is still too loud or quiet — the
+  master slider stays a single global control.
+- **Drag to reorder.** Pads drag by their body; a line marks where the drop
+  lands. Order matters because `1`-`9` fire by position, so dragging is also how
+  you choose which key hits which pad.
 - **Keyboard.** While the panel is focused, `1`–`9` fire the first nine pads and
   `Escape` closes it.
 - **⌘K command.** "Open Soundboard" from the command palette.
@@ -73,6 +78,14 @@ it finishes — typically a few seconds for a short clip.
   `uvx`, which ships with Hermes, so in practice only **ffmpeg** has to be on
   `PATH`. Both are probed before the field is offered, and a missing one is
   named in the error rather than failing silently.
+- **Trim it.** Two optional fields beneath the URL take a start time and a
+  length in seconds, so you grab the one 2-second sound you wanted instead of
+  the opening of the video. ffmpeg cuts the window after the download.
+- **Loudness-normalised.** The same ffmpeg pass runs `loudnorm` to about -16 LUFS,
+  which matters: a YouTube clip is routinely 8-10 dB quieter than a hand-made
+  one, and a pad that plays at half the volume of its neighbours reads as broken.
+  A measured import went from **-30.7 dB mean / -11.3 dB peak** to **-19.1 /
+  -4.3**.
 - **30-second cap.** A soundboard cue wants seconds, not a track. The duration
   is checked before downloading anything; a longer video is refused with its
   length in the message.
@@ -90,6 +103,7 @@ status file. Three details are load-bearing and each was a real failure first:
 |---|---|
 | Every path is **relative**, anchored by `%~dp0` | Batch needs `%%` for a literal `%`, so an env-var path like `%APPDATA%` written through the same escaper became the literal text `%%APPDATA%%` — the script could not `cd`, exited 0, and wrote **no status file**, so the plugin waited out its whole budget on a job that had already died |
 | The script takes **no arguments** | `start /b cmd /c "script.cmd" "arg"` silently drops arguments — four forms were probed, all arrived empty. Every path is baked into the script instead |
+| The trim/normalise step is **parenthesised** | `a && b >> log` redirects only `b`, and a trailing `>nul` collides with it — the whole post-process silently vanished. `( a && b ) >> log` covers the chain |
 | `%` is **doubled** | `-o out.%(ext)s` — an unescaped `%` makes cmd refuse to parse the whole file (`File Not Found`), running no line at all |
 | Duration is probed **in the foreground** | `--match-filter "duration <= 30"` puts `<`/`>` in the command, which cmd eats as redirection even inside quotes; yt-dlp then reports "You must provide at least one URL" |
 

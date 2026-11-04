@@ -724,6 +724,50 @@ click(iconButton('Done'))
 
 // Stop all + close.
 click(iconButton('Stop all sounds'))
+// ── reorder + per-pad gain ──────────────────────────────────────────────
+check('a pad moves to a new index, and the order persists', () => {
+  const engine = boot.ctx.__engine ?? null
+  if (!engine) throw new Error('no engine handle')
+  const before = engine.sounds.get().map(s => s.name)
+  if (before.length < 3) throw new Error('need three pads')
+  engine.move(engine.sounds.get()[0].id, 2)
+  const after = engine.sounds.get().map(s => s.name)
+  if (after[2] !== before[0]) throw new Error(`order is ${after.join(', ')}`)
+  if (after.length !== before.length) throw new Error('move changed the count')
+  const saved = JSON.parse(storage.get('sounds')).map(s => s.name)
+  if (JSON.stringify(saved) !== JSON.stringify(after)) throw new Error('order not persisted')
+})
+
+check('moving out of range is clamped, not dropped', () => {
+  const engine = boot.ctx.__engine
+  const count = engine.sounds.get().length
+  engine.move(engine.sounds.get()[0].id, 999)
+  if (engine.sounds.get().length !== count) throw new Error('a pad was lost')
+  engine.move(engine.sounds.get()[0].id, -5)
+  if (engine.sounds.get().length !== count) throw new Error('a pad was lost')
+})
+
+check('a per-pad gain persists, and 100% stores nothing', () => {
+  const engine = boot.ctx.__engine
+  const id = engine.sounds.get()[0].id
+  engine.setGain(id, 150)
+  let saved = JSON.parse(storage.get('sounds')).find(s => s.id === id)
+  if (saved.gain !== 150) throw new Error(`gain=${saved.gain}`)
+  engine.setGain(id, 100)
+  saved = JSON.parse(storage.get('sounds')).find(s => s.id === id)
+  if (saved.gain !== undefined) throw new Error('100% left a stale gain field')
+})
+
+check('gain is clamped to 0-200', () => {
+  const engine = boot.ctx.__engine
+  const id = engine.sounds.get()[0].id
+  engine.setGain(id, 500)
+  if (JSON.parse(storage.get('sounds')).find(s => s.id === id).gain !== 200) throw new Error('not clamped high')
+  engine.setGain(id, -40)
+  if (JSON.parse(storage.get('sounds')).find(s => s.id === id).gain !== 0) throw new Error('not clamped low')
+  engine.setGain(id, 100)
+})
+
 check('stop-all clears the active flashes', () => {
   if (pads().some(pad => pad.getAttribute('data-active') === 'true')) throw new Error('a pad is still flashing')
 })

@@ -498,6 +498,12 @@ async function runShell(command, { capture = false } = {}) {
   return capture ? stdout : code === 0 || Boolean(stdout)
 }
 
+/** Quote a VALUE for a batch command line (no percent escaping — the post step
+ *  uses fixed names, and jobScript does its own escaping for its arguments). */
+function q0(value) {
+  return `"${String(value).replace(/"/g, '')}"`
+}
+
 /** The job is a SCRIPT FILE, not a command line.
  *
  * `shell.exec` takes one string with `shell=True`, so an argument list has to
@@ -513,7 +519,7 @@ async function runShell(command, { capture = false } = {}) {
  * loop waited FOREVER on a job that had already died. Keeping the argument list
  * relative leaves `%` doubling needed only for yt-dlp's own `%(ext)s` template.
  */
-function jobScript({ exe, args, out, log, status, mp3 }) {
+function jobScript({ exe, args, out, log, status, mp3, post }) {
   // Double the percent for batch — yt-dlp's template is `%(ext)s`, and cmd
   // refuses to parse the WHOLE file on a lone one ("File Not Found", zero lines
   // run). Quotes are stripped, never escaped: a path never legitimately holds
@@ -528,13 +534,29 @@ function jobScript({ exe, args, out, log, status, mp3 }) {
     `cd /d ${q(out ?? '%~dp0')}`,
     `rem ${run}`,
     `${run} > ${q(log)} 2>&1`,
-    'set "RC=%ERRORLEVEL%"',
+    'set "RC=%ERRORLEVEL%"'
+  ]
+
+  // POST-PROCESS: trim to the chosen window and normalise loudness. Runs as a
+  // separate step so the download's own exit code stays meaningful, and appends
+  // to the same log. The result replaces the original, and `mp3` names the file
+  // the status check looks for — so a failed post-process leaves the raw file
+  // (still playable) and reports ok, rather than losing the download.
+  if (post) {
+    // Parenthesised: `a && b >> log` applies the redirect to `b` only, and a
+    // trailing `>nul` in the chain collides with it. Grouping makes the whole
+    // step write to the same log.
+    lines.push(`rem post: ${post}`)
+    lines.push(`( ${post} ) >> ${q(log)} 2>&1`)
+  }
+
+  lines.push(
     // Written in EVERY case, including a failed cd: a status file is the only
     // way the plugin learns the job ended at all.
     `if exist ${q(mp3)} (echo ok> ${q(status)}) else (echo fail> ${q(status)})`,
     'endlocal',
     'exit /b %RC%'
-  ]
+  )
   return lines.join('\r\n') + '\r\n'
 }
 
@@ -636,8 +658,15 @@ function cleanSound(raw) {
   // to several events at once.
   const triggers = cleanTriggers(raw.triggers ?? raw.trigger)
   const bound = triggers.length ? { triggers } : {}
+  // Per-pad trim, 0-200%. 100 (or absent) is the neutral default, so the field
+  // is dropped rather than stored as noise.
+  const gainValue = Number(raw.gain)
+  const gain = Number.isFinite(gainValue) && gainValue >= 0 && gainValue <= 200 && Math.round(gainValue) !== 100
+    ? Math.round(gainValue)
+    : null
+  const trimmed = gain === null ? bound : { ...bound, gain }
   if (raw.kind === 'synth') {
-    return SYNTH_BY_ID.has(raw.synth) ? { id: raw.id, name, kind: 'synth', synth: raw.synth, ...bound } : null
+    return SYNTH_BY_ID.has(raw.synth) ? { id: raw.id, name, kind: 'synth', synth: raw.synth, ...trimmed } : null
   }
   if (raw.kind === 'file' && typeof raw.mime === 'string' && MIME_RE.test(raw.mime)) {
     return {
@@ -646,7 +675,7 @@ function cleanSound(raw) {
       kind: 'file',
       mime: raw.mime,
       bytes: Number.isFinite(raw.bytes) && raw.bytes > 0 ? Math.round(raw.bytes) : 0,
-      ...bound
+      ...trimmed
     }
   }
 
@@ -774,6 +803,14 @@ function createEngine(ctx) {
   // and whichever expires first clears the flag the second one just set — so the
   // pad goes dark early, or an assertion right after the second fire sees
   // nothing at all.
+  /** Master volume × this pad's own trim, clamped to something playable. */
+  function gainFor(sound) {
+    const master = settings.get().volume / 100
+    const trim = Number.isFinite(sound?.gain) ? sound.gain / 100 : 1
+
+    return Math.max(0, Math.min(1, master * trim))
+  }
+
   function flash(id) {
     const previous = timers.get(id)
     if (previous) clearTimeout(previous)
@@ -874,7 +911,7 @@ function createEngine(ctx) {
   function play(sound) {
     if (disposed || !sound) return
     flash(sound.id)
-    const gain = settings.get().volume / 100
+    const gain = gainFor(sound)
     if (sound.kind === 'synth') playSynth(sound.synth, gain)
     else {
       void playFile(sound, gain).catch(error =>
@@ -908,7 +945,7 @@ function createEngine(ctx) {
       if (!sound.triggers.includes(triggerId)) continue
       flash(sound.id)
       fired += 1
-      const gain = settings.get().volume / 100
+      const gain = gainFor(sound)
       if (gain <= 0) continue
       if (sound.kind === 'synth') playSynth(sound.synth, gain)
       else void playFile(sound, gain).catch(() => {})
@@ -964,7 +1001,7 @@ function createEngine(ctx) {
    * writes lives in the plugin's OWN data folder, so `ctx.files` can read the
    * result back without needing an absolute path anywhere else.
    */
-  async function importYoutube(input, { onStage } = {}) {
+  async function importYoutube(input, { onStage, start = 0, length = null } = {}) {
     const files = ctx.files
     if (!files) throw new ImportError('noFileAccess', t('noFileAccess'))
     const videoId = parseYoutube(input)
@@ -1013,6 +1050,24 @@ function createEngine(ctx) {
       `https://www.youtube.com/watch?v=${videoId}`
     ]
 
+    // ffmpeg rewrites the downloaded file in place: trim the window, then
+    // normalise to a broadcast-ish level. Every pad then plays at a comparable
+    // volume — a YouTube clip is routinely 8-10 dB quieter than a hand-made one,
+    // which reads as "this pad doesn't work".
+    const from = Math.max(0, Number(start) || 0)
+    const span = length === null ? null : Math.max(0.2, Number(length) || 0)
+    const post = [
+      'ffmpeg',
+      '-hide_banner', '-loglevel', 'error',
+      ...(from > 0 ? ['-ss', String(from)] : []),
+      ...(span ? ['-t', String(span)] : []),
+      '-i', q0(`${stem}.mp3`),
+      '-af', q0('loudnorm=I=-16:TP=-1.5:LRA=11'),
+      '-b:a', '128k',
+      '-y', q0(`${stem}.out.mp3`),
+      `&& move /y ${q0(`${stem}.out.mp3`)} ${q0(`${stem}.mp3`)}`
+    ].join(' ')
+
     const scriptPath = `.${stem}.cmd`
     // Relative names only — see jobScript. The script anchors to its own folder,
     // so nothing here needs an absolute path or an env var.
@@ -1022,7 +1077,8 @@ function createEngine(ctx) {
       out: '%~dp0',
       log: `.${stem}.log`,
       status: `.${stem}.status`,
-      mp3: `${stem}.mp3`
+      mp3: `${stem}.mp3`,
+      post
     })
     const wroteScript = await files.writeText(files.dataFolder, scriptPath, script)
     if (!wroteScript.ok) throw new ImportError('failed', wroteScript.message || t('saveFailed'))
@@ -1173,6 +1229,33 @@ function createEngine(ctx) {
     persistSounds(sounds.get().filter(item => item.id !== soundId))
   }
 
+  /** Move a pad to a new index. Order is what the 1-9 keys address, so this is
+   *  also how you choose which pad each key fires. */
+  function move(soundId, toIndex) {
+    const current = sounds.get()
+    const from = current.findIndex(item => item.id === soundId)
+    if (from < 0) return
+    const to = Math.max(0, Math.min(current.length - 1, Math.round(toIndex)))
+    if (to === from) return
+    const next = [...current]
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    persistSounds(next)
+  }
+
+  /** A per-pad gain multiplier, 0-200%. The master volume is global; this is
+   *  for the one clip that is still too loud or too quiet after normalisation. */
+  function setGain(soundId, percent) {
+    const value = Math.max(0, Math.min(200, Math.round(Number(percent) || 0)))
+    persistSounds(
+      sounds.get().map(sound => {
+        if (sound.id !== soundId) return sound
+        const { gain: _drop, ...rest } = sound
+        return value === 100 ? rest : { ...rest, gain: value }
+      })
+    )
+  }
+
   function rename(soundId, name) {
     const cleaned = cleanName(name, '')
     const current = sounds.get()
@@ -1224,6 +1307,8 @@ function createEngine(ctx) {
     bind: toggleTrigger,
     toggleTrigger,
     clearTriggers,
+    move,
+    setGain,
     importYoutube,
     ytJob,
     notify,
@@ -1336,6 +1421,20 @@ const CSS = `
   font-size:10px;line-height:14px;color:var(--ui-text-tertiary);
   border-top:1px solid var(--ui-stroke-secondary)}
 .hermes-sb-menu-clear:hover{color:var(--ui-text-primary);background-color:var(--chrome-action-hover)}
+/* Per-pad trim: three tiny cells, aligned to the row's 21px control height. */
+.hermes-sb-gain{display:flex;align-items:center;gap:1px;flex:0 0 auto;height:21px}
+.hermes-sb-gain-step{width:14px;height:21px;border-radius:3px;font-size:11px;line-height:1;
+  color:var(--ui-text-tertiary);background:transparent}
+.hermes-sb-gain-step:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
+.hermes-sb-gain-value{min-width:26px;text-align:center;font-size:9px;line-height:11px;
+  font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
+.hermes-sb-gain-value[data-off=true]{color:var(--ui-accent)}
+/* Dragging: the source dims, and a pad the drag would land before gets a line
+   on its leading edge so the drop position is visible, not guessed. */
+.hermes-sb-pad[data-dragging=true]{opacity:.4}
+.hermes-sb-pad[data-drop-before=true]{box-shadow:inset 2px 0 0 0 var(--ui-accent)}
+.hermes-sb-pad[draggable=true]{cursor:grab}
+.hermes-sb-pad[draggable=true]:active{cursor:grabbing}
 .hermes-sb-rowbtn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex-shrink:0;border-radius:4px;color:var(--ui-text-tertiary)}
 .hermes-sb-rowbtn:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
 .hermes-sb-rowbtn[data-destructive=true]{color:var(--ui-text-secondary)}
@@ -1372,6 +1471,21 @@ const CSS = `
 .hermes-sb-yt-go:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
 .hermes-sb-yt-go:disabled{opacity:.45;cursor:default;border-color:var(--ui-stroke-tertiary);color:var(--ui-text-quaternary)}
 .hermes-sb-yt-go:disabled:hover{border-color:var(--ui-stroke-tertiary);color:var(--ui-text-quaternary)}
+/* Same 6px side padding as the URL row and the panel's own content inset, so
+   the two rows share one left guide — without it "from" clipped at the edge. */
+.hermes-sb-yt-trim{display:flex;align-items:center;gap:6px;margin-top:4px;padding:0 1px}
+.hermes-sb-yt-trim-field{display:flex;align-items:center;gap:3px;flex:0 0 auto}
+.hermes-sb-yt-trim-label{font-size:9px;line-height:11px;color:var(--ui-text-tertiary);white-space:nowrap}
+.hermes-sb-yt-trim-input{width:46px;height:19px;box-sizing:border-box;padding:0 5px;border-radius:3px;
+  font:inherit;font-size:10px;color:var(--ui-text-primary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary);outline:none}
+.hermes-sb-yt-trim-input:focus{border-color:var(--ui-accent)}
+.hermes-sb-yt-trim-input:disabled{opacity:.5}
+/* Numbers are the point here, so keep the spinner out of a 46px field. */
+.hermes-sb-yt-trim-input::-webkit-inner-spin-button,
+.hermes-sb-yt-trim-input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.hermes-sb-yt-trim-hint{flex:1;min-width:0;font-size:9px;line-height:11px;color:var(--ui-text-quaternary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;padding-right:2px}
 .hermes-sb-yt-progress{display:flex;align-items:center;gap:6px;margin-top:6px}
 .hermes-sb-yt-bar{flex:1;min-width:0;height:4px;border-radius:2px;overflow:hidden;background-color:var(--ui-bg-tertiary)}
 .hermes-sb-yt-bar-fill{height:100%;border-radius:2px;background-color:var(--ui-accent);
@@ -1392,12 +1506,34 @@ const CSS = `
 
 // ── UI ────────────────────────────────────────────────────────────────────
 
-function Pad({ sound, index, engine }) {
+function Pad({ sound, index, engine, dragging, dragTarget, onDragStart, onDragOver, onDrop, onDragEnd }) {
   const active = useValue(engine.active)
   return jsxs('button', {
     type: 'button',
     className: 'hermes-sb-pad',
+    draggable: true,
     'data-active': Boolean(active[sound.id]),
+    'data-dragging': dragging === sound.id,
+    // A pad the dragged one would land in front of: one line marks the seam,
+    // so the drop position is visible while dragging rather than guessed.
+    'data-drop-before': dragTarget === index && dragging && dragging !== sound.id,
+    onDragStart: event => {
+      event.dataTransfer.effectAllowed = 'move'
+      // Some Electron builds require data to be set for a drag to start.
+      event.dataTransfer.setData('text/plain', sound.id)
+      onDragStart?.(sound.id)
+    },
+    onDragOver: event => {
+      if (!dragging) return
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'move'
+      onDragOver?.(index)
+    },
+    onDrop: event => {
+      event.preventDefault()
+      onDrop?.(index)
+    },
+    onDragEnd: () => onDragEnd?.(),
     // Present only on a custom pad: React renders boolean `data-*` as the
     // string "false", and an always-present attribute would read as truthy.
     ...(sound.kind === 'file' ? { 'data-custom': 'true' } : {}),
@@ -1643,6 +1779,34 @@ function ManageRow({ sound, engine }) {
           }
         }
       }),
+      // Per-pad trim. Steps by 25% so a full 0-200% range is reachable with
+      // four clicks of the arrows; the value reads at a glance without a
+      // popover. Blank input means 100%.
+      jsx('div', {
+        className: 'hermes-sb-gain',
+        children: [
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-gain-step',
+            'aria-label': `${t('gainDown')}: ${sound.name}`,
+            onClick: () => engine.setGain(sound.id, (sound.gain ?? 100) - 25),
+            children: '−'
+          }),
+          jsx('span', {
+            className: 'hermes-sb-gain-value',
+            'data-off': sound.gain !== undefined && sound.gain !== 100,
+            title: t('gainHint'),
+            children: `${sound.gain ?? 100}%`
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-gain-step',
+            'aria-label': `${t('gainUp')}: ${sound.name}`,
+            onClick: () => engine.setGain(sound.id, (sound.gain ?? 100) + 25),
+            children: '+'
+          })
+        ]
+      }),
       jsx(Tip, {
         label: `${t('delete')}: ${sound.name}`,
         children: jsx('button', {
@@ -1667,10 +1831,17 @@ function Panel({ engine }) {
   const ytJob = useValue(engine.ytJob)
   const [manage, setManage] = useState(false)
   const [dragging, setDragging] = useState(false)
+  // Which pad is being dragged, and which gap it would drop into.
+  const [dragId, setDragId] = useState(null)
+  const [dragIndex, setDragIndex] = useState(null)
   // YouTube import: the field is behind a button, the job is fire-and-watch.
   const [ytOpen, setYtOpen] = useState(false)
   const [ytUrl, setYtUrl] = useState('')
   const [ytBusy, setYtBusy] = useState(false)
+  // Optional trim window. Blank start = from the beginning; blank length = the
+  // whole (already capped) clip.
+  const [ytStart, setYtStart] = useState('')
+  const [ytLength, setYtLength] = useState('')
   const [ytError, setYtError] = useState('')
   const panelRef = useRef(null)
   const fileRef = useRef(null)
@@ -1695,8 +1866,13 @@ function Panel({ engine }) {
     setYtBusy(true)
     setYtError('')
     try {
-      const sound = await engine.importYoutube(value)
+      const sound = await engine.importYoutube(value, {
+        start: ytStart.trim() ? Number(ytStart) : 0,
+        length: ytLength.trim() ? Number(ytLength) : null
+      })
       setYtUrl('')
+      setYtStart('')
+      setYtLength('')
       setYtOpen(false)
       // The toast goes through the engine: `ctx` is only in scope inside
       // register(), and reaching for it from the panel threw a ReferenceError
@@ -1870,6 +2046,50 @@ function Panel({ engine }) {
           })
         : null,
 
+      ytOpen
+        ? jsxs('div', {
+            className: 'hermes-sb-yt-trim',
+            children: [
+              jsx('label', {
+                className: 'hermes-sb-yt-trim-field',
+                children: [
+                  jsx('span', { className: 'hermes-sb-yt-trim-label', children: t('ytStart') }),
+                  jsx('input', {
+                    type: 'number',
+                    min: '0',
+                    step: '0.1',
+                    className: 'hermes-sb-yt-trim-input',
+                    placeholder: '0',
+                    value: ytStart,
+                    disabled: ytBusy,
+                    'aria-label': t('ytStart'),
+                    onChange: event => setYtStart(event.target.value)
+                  })
+                ]
+              }),
+              jsx('label', {
+                className: 'hermes-sb-yt-trim-field',
+                children: [
+                  jsx('span', { className: 'hermes-sb-yt-trim-label', children: t('ytLength') }),
+                  jsx('input', {
+                    type: 'number',
+                    min: '0.2',
+                    step: '0.1',
+                    max: '30',
+                    className: 'hermes-sb-yt-trim-input',
+                    placeholder: 'all',
+                    value: ytLength,
+                    disabled: ytBusy,
+                    'aria-label': t('ytLength'),
+                    onChange: event => setYtLength(event.target.value)
+                  })
+                ]
+              }),
+              jsx('span', { className: 'hermes-sb-yt-trim-hint', children: t('ytTrimHint') })
+            ]
+          })
+        : null,
+
       ytBusy
         ? jsxs('div', {
             className: 'hermes-sb-yt-progress',
@@ -1923,7 +2143,36 @@ function Panel({ engine }) {
               className: 'hermes-sb-grid',
               style: { gridTemplateColumns: `repeat(${settings.padsPerRow}, minmax(0, 1fr))` },
               children: [
-                ...sounds.slice(0, 24).map((sound, index) => jsx(Pad, { sound, index, engine }, sound.id)),
+                ...sounds.slice(0, 24).map((sound, index) =>
+                  jsx(
+                    Pad,
+                    {
+                      sound,
+                      index,
+                      engine,
+                      dragging: dragId,
+                      dragTarget: dragIndex,
+                      onDragStart: id => {
+                        setDragId(id)
+                        setDragIndex(index)
+                      },
+                      onDragOver: target => setDragIndex(target),
+                      onDrop: target => {
+                        // Dropping ON a pad means "take that pad's place"; the
+                        // engine clamps and reorders from the id, so the index
+                        // is all it needs.
+                        if (dragId) engine.move(dragId, target)
+                        setDragId(null)
+                        setDragIndex(null)
+                      },
+                      onDragEnd: () => {
+                        setDragId(null)
+                        setDragIndex(null)
+                      }
+                    },
+                    sound.id
+                  )
+                ),
                 // The insertion point lives where the list ends, and it fills
                 // the short last row a 7-pad board would otherwise leave empty.
                 sounds.length < MAX_SOUNDS
@@ -2111,6 +2360,12 @@ const LOCALES = {
     ytOpen: 'Import from YouTube',
     ytPlaceholder: 'YouTube link or video id',
     ytImport: 'Convert to mp3',
+    ytStart: 'from',
+    ytLength: 'length',
+    ytTrimHint: 'seconds — blank = whole clip',
+    gainUp: 'Raise volume for',
+    gainDown: 'Lower volume for',
+    gainHint: 'This pad\'s own volume, relative to the master slider',
     ytWorking: 'Converting…',
     ytAdded: 'Added “{name}”.',
     ytBadUrl: 'That is not a YouTube link.',
@@ -2160,6 +2415,12 @@ const LOCALES = {
     ytOpen: 'Importuj z YouTube',
     ytPlaceholder: 'Link do YouTube lub id filmu',
     ytImport: 'Konwertuj do mp3',
+    ytStart: 'od',
+    ytLength: 'długość',
+    ytTrimHint: 'sekundy — puste = cały klip',
+    gainUp: 'Podgłoś',
+    gainDown: 'Ścisz',
+    gainHint: 'Głośność tej podkładki względem głównego suwaka',
     ytWorking: 'Pobieranie i konwersja… to może chwilę potrwać.',
     ytAdded: 'Dodano „{name}”.',
     ytBadUrl: 'To nie jest link do YouTube.',

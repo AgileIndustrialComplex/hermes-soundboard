@@ -606,6 +606,36 @@ await page.fill('.hermes-sb-yt-input', 'https://www.youtube.com/watch?v=jNQXAC9I
 await page.waitForTimeout(120)
 await shot('preview-youtube.png')
 
+// The trim fields must be present and consistent with the row above.
+const trim = await page.evaluate(() => {
+  const fields = [...document.querySelectorAll('.hermes-sb-yt-trim-input')]
+  return {
+    count: fields.length,
+    types: fields.map(f => f.type),
+    widths: fields.map(f => Math.round(f.getBoundingClientRect().width)),
+    labels: [...document.querySelectorAll('.hermes-sb-yt-trim-label')].map(l => l.textContent)
+  }
+})
+console.log(`trim fields: ${JSON.stringify(trim)}`)
+const insets = await page.evaluate(() => {
+  const url = document.querySelector('.hermes-sb-yt-input')?.getBoundingClientRect()
+  const label = document.querySelector('.hermes-sb-yt-trim-label')?.getBoundingClientRect()
+  const field = document.querySelector('.hermes-sb-yt-trim-input')?.getBoundingClientRect()
+  return {
+    urlLeft: url ? Math.round(url.left) : null,
+    labelLeft: label ? Math.round(label.left) : null,
+    fieldLeft: field ? Math.round(field.left) : null
+  }
+})
+console.log(`left edges — url ${insets.urlLeft}, trim label ${insets.labelLeft}, trim field ${insets.fieldLeft}`)
+if (insets.labelLeft !== null && insets.labelLeft > insets.urlLeft + 1) {
+  console.log(`!! the trim row starts ${insets.labelLeft - insets.urlLeft}px right of the URL row`)
+}
+if (insets.labelLeft !== null && insets.labelLeft < insets.urlLeft - 2) {
+  console.log('!! the trim row hangs past the URL row on the left (clipping risk)')
+}
+if (trim.count !== 2) console.log('!! expected two trim fields')
+
 await page.click('.hermes-sb-yt-go')
 // The bar must appear while the job runs — that is the whole point of it.
 let sawProgress = false
@@ -717,6 +747,30 @@ else console.log(`  audible: advanced to ${playState.currentTime.toFixed(2)}s of
 const fieldOpen = await page.$('.hermes-sb-yt-input')
 console.log(`import field closed after success: ${!fieldOpen}`)
 if (fieldOpen) console.log('!! the field stayed open')
+
+// ── manage rows: the gain control ───────────────────────────────────────
+await page.click('.hermes-sb-panel button[aria-label="Manage sounds"]')
+await page.waitForTimeout(300)
+const gainState = await page.evaluate(() => {
+  const rows = [...document.querySelectorAll('.hermes-sb-row')]
+  return {
+    rows: rows.length,
+    gains: [...document.querySelectorAll('.hermes-sb-gain-value')].map(n => n.textContent),
+    steps: document.querySelectorAll('.hermes-sb-gain-step').length,
+    // Consistent control height is what makes a row look tidy.
+    heights: [...document.querySelectorAll('.hermes-sb-gain, .hermes-sb-picker')].map(
+      n => Math.round(n.getBoundingClientRect().height)
+    )
+  }
+})
+console.log(`gain controls: ${JSON.stringify(gainState)}`)
+if (gainState.rows && gainState.steps !== gainState.rows * 2) {
+  console.log(`!! expected 2 step buttons per row, got ${gainState.steps}`)
+}
+if (new Set(gainState.heights).size > 1) console.log(`!! control heights differ: ${gainState.heights}`)
+await shot('preview-manage.png')
+await page.click('.hermes-sb-panel button[aria-label="Done"]')
+await page.waitForTimeout(200)
 
 // Settings page.
 await page.evaluate(() => window.__mountSettings())

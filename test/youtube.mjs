@@ -130,6 +130,43 @@ check('an argument containing a quote cannot break out', () => {
   if (!evil.includes('"x & shutdown /s & "')) throw new Error(evil)
 })
 
+// ── trim + normalise (the ffmpeg post step) ─────────────────────────────
+const trimmed = jobScript({
+  exe: 'uvx yt-dlp',
+  args: ['-o', 'a.%(ext)s', 'x'],
+  out: '%~dp0',
+  log: '.a.log',
+  status: '.a.status',
+  mp3: 'a.mp3',
+  post: 'ffmpeg -ss 0.5 -t 1.2 -i "a.mp3" -af "loudnorm=I=-16" -y "a.out.mp3" && move /y "a.out.mp3" "a.mp3"'
+})
+
+check('the post step runs after the download', () => {
+  const lines = trimmed.split('\r\n')
+  const dl = lines.findIndex(l => l.startsWith('uvx yt-dlp'))
+  const post = lines.findIndex(l => l.startsWith('( ffmpeg'))
+  if (post < dl) throw new Error('post step precedes the download')
+})
+check('the post step is GROUPED so one redirect covers the whole chain', () => {
+  // `a && b >> log` redirects only b, and a trailing `>nul` in the chain
+  // collides with it — that combination silently swallowed the whole step.
+  const exec = trimmed.split('\r\n').find(l => l.startsWith('( ffmpeg'))
+  if (!exec || !/^\( ffmpeg .* \) >> "\.a\.log" 2>&1$/.test(exec)) throw new Error(String(exec))
+})
+check('the post step never uses >nul inside a redirected chain', () => {
+  const line = trimmed.split('\r\n').find(l => l.startsWith('( ffmpeg')) ?? ''
+  if (/>nul/.test(line)) throw new Error(line)
+})
+check('the status check looks for the FINAL mp3', () => {
+  const line = trimmed.split('\r\n').find(l => l.startsWith('if exist')) ?? ''
+  if (!line.includes('a.mp3')) throw new Error(line)
+  if (line.includes('out.mp3')) throw new Error('status checks the pre-normalise file')
+})
+check('a script without a post step omits it entirely', () => {
+  const plain = jobScript({ exe: 'uvx yt-dlp', args: ['x'], out: '%~dp0', log: '.b.log', status: '.b.status', mp3: 'b.mp3' })
+  if (/ffmpeg/.test(plain)) throw new Error('ffmpeg leaked into a plain job')
+})
+
 // ── the launch command ──────────────────────────────────────────────────
 const D = 'C:\\data dir'
 const launch = detachedCommand(`${D}\\.yt-1.cmd`)
