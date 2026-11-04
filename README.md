@@ -58,9 +58,19 @@ mode all persist per machine.
 
 ## Triggers
 
-A binding is `pad → trigger`. The picker is grouped, and each entry maps to one
-real gateway event with a filter, so a pad reacts to "the turn finished
-successfully", not "every `message.complete` frame".
+A binding is `pad → triggers`, plural. The picker is grouped and **multi-select**:
+each click toggles one trigger and leaves the menu open, so a single pad can
+answer to a whole family of events — one sound for "the agent needs me", bound
+to approvals, questions and warnings alike. With nothing bound the control reads
+*Never*; with one binding it names that trigger; with several it reads *3
+triggers* and a tooltip lists them all. *Clear all triggers* empties the list.
+
+Each entry maps to one real gateway event with a filter, so a pad reacts to "the
+turn finished successfully", not "every `message.complete` frame".
+
+Stored shape is `triggers: ["turn.complete", …]`. A save written by an earlier
+version holds a single `trigger: "id"` string; it is migrated to a one-entry list
+on load, and unknown or duplicate ids are dropped.
 
 | Group | Trigger | Underlying event | Fires when |
 |---|---|---|---|
@@ -123,6 +133,8 @@ the cue is never silently lost.
 ![The soundboard popover](shots/preview-panel.png)
 
 ![The trigger picker open](shots/preview-menu.png)
+
+![Two triggers on one pad](shots/preview-multi.png)
 
 | | |
 |---|---|

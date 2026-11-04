@@ -334,6 +334,21 @@ function cleanTrigger(value) {
   return typeof value === 'string' && TRIGGER_BY_ID.has(value) ? value : null
 }
 
+/** A pad's trigger list, normalised.
+ *
+ * Storage holds an ARRAY, but anything written by an earlier version holds a
+ * single string — so both are accepted here and a bare string becomes a
+ * one-entry list. Unknown ids are dropped, duplicates collapse, and order
+ * follows TRIGGERS rather than insertion so the row's chips read the same way
+ * every time.
+ */
+function cleanTriggers(value) {
+  const list = Array.isArray(value) ? value : typeof value === 'string' ? [value] : []
+  const wanted = new Set(list.map(cleanTrigger).filter(Boolean))
+
+  return TRIGGERS.filter(trigger => wanted.has(trigger.id)).map(trigger => trigger.id)
+}
+
 // ── data hygiene ──────────────────────────────────────────────────────────
 // Everything read back from storage is user-editable JSON, so each entry is
 // rebuilt from scratch; anything unrecognised is dropped rather than trusted.
@@ -353,9 +368,10 @@ function cleanSound(raw) {
   const name = cleanName(raw.name, '')
   if (!name) return null
   // A binding rides on the sound, so any sound can be a trigger — a synthesized
-  // cue or the user's own clip alike.
-  const trigger = cleanTrigger(raw.trigger)
-  const bound = trigger ? { trigger } : {}
+  // cue or the user's own clip alike. Stored as a list since a pad may answer
+  // to several events at once.
+  const triggers = cleanTriggers(raw.triggers ?? raw.trigger)
+  const bound = triggers.length ? { triggers } : {}
   if (raw.kind === 'synth') {
     return SYNTH_BY_ID.has(raw.synth) ? { id: raw.id, name, kind: 'synth', synth: raw.synth, ...bound } : null
   }
@@ -469,7 +485,8 @@ function createEngine(ctx) {
   /** The most recent trigger that actually fired, for the panel's readout. */
   const lastTrigger = atom(null)
 
-  const timers = new Set()
+  // pad id -> its one pending flash timer.
+  const timers = new Map()
   const urls = new Map()
   const playing = new Set()
   let audioContext = null
@@ -486,16 +503,23 @@ function createEngine(ctx) {
     ctx.storage.set('settings', next)
   }
 
+  // One pending flash timer per pad, not per flash. Two triggers bound to the
+  // same pad (or a pad played twice quickly) otherwise leave two timers running,
+  // and whichever expires first clears the flag the second one just set — so the
+  // pad goes dark early, or an assertion right after the second fire sees
+  // nothing at all.
   function flash(id) {
+    const previous = timers.get(id)
+    if (previous) clearTimeout(previous)
     active.set({ ...active.get(), [id]: true })
     const timer = setTimeout(() => {
-      timers.delete(timer)
+      timers.delete(id)
       if (disposed) return
       const next = { ...active.get() }
       delete next[id]
       active.set(next)
     }, FLASH_MS)
-    timers.add(timer)
+    timers.set(id, timer)
   }
 
   function context() {
@@ -559,7 +583,7 @@ function createEngine(ctx) {
   // policy and a resumed context is not guaranteed. Every trigger attempts a
   // resume; if the context refuses, the pad still flashes so the cue is not
   // silently lost, and the panel shows the last trigger.
-  const bound = () => sounds.get().filter(sound => sound.trigger)
+  const bound = () => sounds.get().filter(sound => sound.triggers?.length)
 
   function fire(triggerId, event) {
     if (disposed) return
@@ -576,7 +600,7 @@ function createEngine(ctx) {
     lastTrigger.set({ id: triggerId, at: Date.now() })
     let fired = 0
     for (const sound of bound()) {
-      if (sound.trigger !== triggerId) continue
+      if (!sound.triggers.includes(triggerId)) continue
       flash(sound.id)
       fired += 1
       const gain = settings.get().volume / 100
@@ -599,13 +623,31 @@ function createEngine(ctx) {
     })
   }
 
-  function bind(soundId, triggerId) {
+  /** Add or remove ONE trigger on a pad, leaving its other bindings alone. */
+  function toggleTrigger(soundId, triggerId) {
     const next = cleanTrigger(triggerId)
+    if (!next) return
     persistSounds(
       sounds.get().map(sound => {
         if (sound.id !== soundId) return sound
-        const { trigger: _drop, ...rest } = sound
-        return next ? { ...rest, trigger: next } : rest
+        const current = sound.triggers ?? []
+        const list = current.includes(next) ? current.filter(id => id !== next) : [...current, next]
+        const { triggers: _drop, ...rest } = sound
+        const ordered = cleanTriggers(list)
+
+        return ordered.length ? { ...rest, triggers: ordered } : rest
+      })
+    )
+  }
+
+  /** Clear every binding on a pad. */
+  function clearTriggers(soundId) {
+    persistSounds(
+      sounds.get().map(sound => {
+        if (sound.id !== soundId) return sound
+        const { triggers: _drop, ...rest } = sound
+
+        return rest
       })
     )
   }
@@ -712,7 +754,7 @@ function createEngine(ctx) {
 
   ctx.onDispose(() => {
     disposed = true
-    for (const timer of timers) clearTimeout(timer)
+    for (const timer of timers.values()) clearTimeout(timer)
     timers.clear()
     for (const audio of playing) {
       audio.pause()
@@ -737,7 +779,9 @@ function createEngine(ctx) {
     addPreset,
     remove,
     rename,
-    bind,
+    bind: toggleTrigger,
+    toggleTrigger,
+    clearTriggers,
     restorePresets,
     setVolume: volume => persistSettings({ volume }),
     setShowLabel: showLabel => persistSettings({ showLabel }),
@@ -834,11 +878,19 @@ const CSS = `
 .hermes-sb-menu-group{display:flex;flex-direction:column}
 .hermes-sb-menu-heading{padding:5px 6px 2px;font-size:9px;line-height:11px;font-weight:600;
   letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-tertiary);background-color:var(--ui-bg-elevated)}
-.hermes-sb-menu-row{display:block;width:100%;padding:3px 6px;border-radius:3px;text-align:left;
+.hermes-sb-menu-row{display:flex;align-items:center;gap:5px;width:100%;padding:3px 6px;border-radius:3px;text-align:left;
   font-size:11px;line-height:15px;color:var(--ui-text-primary);background-color:transparent}
 .hermes-sb-menu-row:hover,.hermes-sb-menu-row[data-cursor=true]{background-color:var(--chrome-action-hover)}
 .hermes-sb-menu-row[data-selected=true]{color:var(--ui-accent);font-weight:600}
-.hermes-sb-menu-row[data-selected=true]::after{content:"✓";float:right;font-weight:400}
+/* A fixed-width check gutter keeps every label on one left edge whether or not
+   its row is bound — a multi-select list that shifts text as you tick items is
+   unreadable while you are ticking them. */
+.hermes-sb-menu-check{flex:0 0 10px;font-size:10px;line-height:15px;color:var(--ui-accent)}
+.hermes-sb-menu-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-sb-menu-clear{display:block;width:100%;margin-top:3px;padding:4px 6px;border-radius:3px;text-align:left;
+  font-size:10px;line-height:14px;color:var(--ui-text-tertiary);
+  border-top:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-menu-clear:hover{color:var(--ui-text-primary);background-color:var(--chrome-action-hover)}
 .hermes-sb-rowbtn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex-shrink:0;border-radius:4px;color:var(--ui-text-tertiary)}
 .hermes-sb-rowbtn:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
 .hermes-sb-rowbtn[data-destructive=true]{color:var(--ui-text-secondary)}
@@ -870,9 +922,9 @@ function Pad({ sound, index, engine }) {
     // Present only on a custom pad: React renders boolean `data-*` as the
     // string "false", and an always-present attribute would read as truthy.
     ...(sound.kind === 'file' ? { 'data-custom': 'true' } : {}),
-    ...(sound.trigger ? { 'data-bound': 'true' } : {}),
-    title: sound.trigger
-      ? `${sound.name} — plays on “${TRIGGER_BY_ID.get(sound.trigger)?.label}”`
+    ...(sound.triggers?.length ? { 'data-bound': 'true' } : {}),
+    title: sound.triggers?.length
+      ? `${sound.name} — ${sound.triggers.map(id => `“${TRIGGER_BY_ID.get(id)?.label}”`).join(', ')}`
       : sound.kind === 'file' ? `${sound.name} — your audio file` : `${sound.name} — built-in tone`,
     'aria-label': sound.name,
     onClick: () => {
@@ -886,16 +938,20 @@ function Pad({ sound, index, engine }) {
   }, sound.id)
 }
 
-/** A trigger picker rendered INSIDE the popover's own DOM.
+/** A multi-trigger picker rendered INSIDE the popover's own DOM.
  *
  * A native <select> was the obvious choice and the wrong one: its option list
  * is not a DOM node, it is a popup the browser draws from the page's
  * `color-scheme`, and inside the Desktop's nested popover it came up as a
  * near-white sheet under cream text — unreadable, and no CSS of ours could
- * reach it. This is a plain button + list, so every pixel is ours, it inherits
- * the theme, and it can be asserted in a screenshot.
+ * reach it. This is a plain button + list, so every pixel is ours.
  *
- * Keyboard: Enter/Space opens, arrows move, Enter picks, Escape closes —
+ * MULTI-SELECT: clicking a trigger TOGGLES it and leaves the menu open, so one
+ * pad can answer to several events. The menu closes on Escape, on a click
+ * outside, or on the "Done" row — a checkbox list that shuts after every click
+ * would make binding three events three round trips.
+ *
+ * Keyboard: Enter/Space opens, arrows move, Enter toggles, Escape closes —
  * handled on the trigger so it does not steal the panel's own key downs.
  */
 function TriggerSelect({ sound, engine }) {
@@ -903,11 +959,12 @@ function TriggerSelect({ sound, engine }) {
   const [open, setOpen] = useState(false)
   const [cursor, setCursor] = useState(-1)
   const boxRef = useRef(null)
-  const current = sound.trigger ? TRIGGER_BY_ID.get(sound.trigger) : null
+  const boundIds = sound.triggers ?? []
+  const boundTriggers = boundIds.map(id => TRIGGER_BY_ID.get(id)).filter(Boolean)
 
   // Flat list of selectable rows in render order, so the cursor can move over
   // a grouped list without knowing about the groups.
-  const flat = [{ id: '', label: t('whenNever'), group: null }, ...TRIGGERS.map(trigger => trigger)]
+  const flat = TRIGGERS.map(trigger => trigger)
 
   useEffect(() => {
     if (!open) return
@@ -917,12 +974,6 @@ function TriggerSelect({ sound, engine }) {
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [open])
-
-  const pick = id => {
-    engine.bind(sound.id, id)
-    setOpen(false)
-    setCursor(-1)
-  }
 
   const onKeyDown = event => {
     if (event.key === 'Escape' && open) {
@@ -935,7 +986,7 @@ function TriggerSelect({ sound, engine }) {
         event.preventDefault()
         event.stopPropagation()
         setOpen(true)
-        setCursor(Math.max(0, flat.findIndex(row => row.id === (sound.trigger ?? ''))))
+        setCursor(0)
       }
       return
     }
@@ -947,11 +998,21 @@ function TriggerSelect({ sound, engine }) {
     } else if (event.key === 'Enter') {
       event.preventDefault()
       event.stopPropagation()
-      if (cursor >= 0) pick(flat[cursor].id)
+      if (cursor >= 0) engine.toggleTrigger(sound.id, flat[cursor].id)
     } else if (event.key === 'Tab') {
       setOpen(false)
     }
   }
+
+  // What the closed control says: nothing, one label, or "N triggers".
+  const summary = boundTriggers.length === 0
+    ? t('whenNever')
+    : boundTriggers.length === 1
+      ? boundTriggers[0].label
+      : t('whenCount').replace('{n}', String(boundTriggers.length))
+  const detail = boundTriggers.length
+    ? boundTriggers.map(trigger => `${trigger.label} — ${trigger.detail}`).join('\n')
+    : t('whenNever')
 
   let rowIndex = -1
 
@@ -974,17 +1035,17 @@ function TriggerSelect({ sound, engine }) {
         type: 'button',
         className: 'hermes-sb-picker',
         'data-open': open,
-        'data-bound': Boolean(sound.trigger),
+        'data-bound': boundTriggers.length > 0,
         'aria-haspopup': 'listbox',
         'aria-expanded': open,
         'aria-label': `${t('when')}: ${sound.name}`,
-        title: current ? current.detail : t('whenNever'),
+        title: detail,
         onClick: () => {
           haptic('tap')
           setOpen(value => !value)
         },
         children: [
-          jsx('span', { className: 'hermes-sb-picker-label', children: current ? current.label : t('whenNever') }),
+          jsx('span', { className: 'hermes-sb-picker-label', children: summary }),
           jsx('span', { className: 'hermes-sb-picker-caret', 'aria-hidden': true })
         ]
       }),
@@ -993,20 +1054,9 @@ function TriggerSelect({ sound, engine }) {
         ? jsx('div', {
             className: 'hermes-sb-menu',
             role: 'listbox',
+            'aria-multiselectable': 'true',
             'aria-label': t('when'),
             children: [
-              jsx(
-                'button',
-                {
-                  type: 'button',
-                  className: 'hermes-sb-menu-row',
-                  'data-selected': !sound.trigger,
-                  'data-cursor': cursor === (rowIndex += 1),
-                  onClick: () => pick(''),
-                  children: t('whenNever')
-                },
-                '__never'
-              ),
               ...TRIGGER_GROUPS.map(group =>
                 jsxs(
                   'div',
@@ -1014,26 +1064,52 @@ function TriggerSelect({ sound, engine }) {
                     className: 'hermes-sb-menu-group',
                     children: [
                       jsx('div', { className: 'hermes-sb-menu-heading', children: group }),
-                      ...TRIGGERS.filter(trigger => trigger.group === group).map(trigger =>
-                        jsx(
+                      ...TRIGGERS.filter(trigger => trigger.group === group).map(trigger => {
+                        const on = boundIds.includes(trigger.id)
+                        rowIndex += 1
+                        const at = rowIndex
+
+                        return jsx(
                           'button',
                           {
                             type: 'button',
                             className: 'hermes-sb-menu-row',
-                            'data-selected': sound.trigger === trigger.id,
-                            'data-cursor': cursor === (rowIndex += 1),
+                            'data-selected': on,
+                            'data-cursor': cursor === at,
+                            // role/state that a screen reader can follow as the
+                            // list stays open across toggles.
+                            role: 'option',
+                            'aria-selected': on,
                             title: trigger.detail,
-                            onClick: () => pick(trigger.id),
-                            children: trigger.label
+                            onClick: () => {
+                              haptic('tap')
+                              engine.toggleTrigger(sound.id, trigger.id)
+                            },
+                            onMouseEnter: () => setCursor(at),
+                            children: [
+                              jsx('span', { className: 'hermes-sb-menu-check', 'aria-hidden': true, children: on ? '✓' : '' }),
+                              jsx('span', { className: 'hermes-sb-menu-text', children: trigger.label })
+                            ]
                           },
                           trigger.id
                         )
-                      )
+                      })
                     ]
                   },
                   group
                 )
-              )
+              ),
+              boundIds.length
+                ? jsx('button', {
+                    type: 'button',
+                    className: 'hermes-sb-menu-clear',
+                    onClick: () => {
+                      engine.clearTriggers(sound.id)
+                      setOpen(false)
+                    },
+                    children: t('whenClear')
+                  }, '__clear')
+                : null
             ]
           })
         : null
@@ -1056,7 +1132,7 @@ function ManageRow({ sound, engine }) {
 
   return jsxs('div', {
     className: 'hermes-sb-row',
-    'data-bound': Boolean(sound.trigger),
+    'data-bound': Boolean(sound.triggers?.length),
     children: [
       jsx(Tip, {
         label: t('preview'),
@@ -1439,6 +1515,8 @@ const LOCALES = {
     unmute: 'Unmute',
     when: 'Play this sound when',
     whenNever: 'Never',
+    whenCount: '{n} triggers',
+    whenClear: 'Clear all triggers',
     lastTrigger: trigger => `Last trigger: ${trigger}`,
     showLabel: 'Show the Soundboard label in the status bar',
     empty: 'No sounds yet. Add an audio file, or drop one here.',
@@ -1468,6 +1546,8 @@ const LOCALES = {
     unmute: 'Wyłącz wyciszenie',
     when: 'Odtwórz ten dźwięk gdy',
     whenNever: 'Nigdy',
+    whenCount: '{n} wyzwalaczy',
+    whenClear: 'Wyczyść wszystkie wyzwalacze',
     lastTrigger: trigger => `Ostatni wyzwalacz: ${trigger}`,
     showLabel: 'Pokazuj podpis Soundboard na pasku stanu',
     empty: 'Brak dźwięków. Dodaj plik audio albo przeciągnij go tutaj.',

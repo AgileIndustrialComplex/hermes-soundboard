@@ -391,7 +391,7 @@ console.log(`  group label ${menu.heading.color} → ${headingRatio?.toFixed(2)}
 if (!/^rgb/.test(menu.background) || menu.background.includes('rgba(0, 0, 0, 0)')) console.log('!! the menu has no opaque background')
 if (menuRatio !== null && menuRatio < 4.5) console.log(`!! menu row text fails 4.5:1 (${menuRatio.toFixed(2)})`)
 if (headingRatio !== null && headingRatio < 3) console.log(`!! group label fails 3:1 (${headingRatio.toFixed(2)})`)
-if (menu.rows < 15) console.log(`!! only ${menu.rows} trigger rows`)
+if (menu.rows !== 14) console.log(`!! expected 14 trigger rows, got ${menu.rows}`)
 if (menu.box.y + menu.box.h > 560) console.log('!! the menu runs off the bottom of the viewport')
 // The menu must be INSIDE the panel and on screen. A fixed-positioned menu
 // anchored to a backdrop-filtered popover still reports a plausible width, so
@@ -409,14 +409,41 @@ if (escaped) console.log('!! the menu escapes the panel box — it is being re-a
 if (menu.box.w < 200) console.log(`!! the menu is only ${menu.box.w}px wide — it is confined to the picker's box, not the row's`)
 await shot('preview-menu.png')
 
-// Pick one from the open menu.
+// ── multi-select, in a real browser ─────────────────────────────────────
+// Two triggers on ONE pad: click the first, then the second, without the menu
+// closing — that is the whole feature, so it gets verified in Chromium and not
+// only in jsdom.
 await page.click('.hermes-sb-menu-row:has-text("Approval needed")')
-await page.waitForTimeout(200)
+await page.waitForTimeout(150)
+const stillOpen = await page.$('.hermes-sb-menu')
+console.log(`menu still open after one toggle: ${Boolean(stillOpen)}`)
+if (!stillOpen) console.log('!! the menu closed on the first pick; multi-select needs it open')
+
+await page.click('.hermes-sb-menu-row:has-text("Turn finishes")')
+await page.waitForTimeout(150)
+const afterTwo = await page.evaluate(() => {
+  const menu = document.querySelector('.hermes-sb-menu')
+  return {
+    selected: [...menu.querySelectorAll('.hermes-sb-menu-row[data-selected="true"]')].map(
+      row => row.querySelector('.hermes-sb-menu-text')?.textContent.trim()
+    ),
+    picker: document.querySelector('.hermes-sb-picker-label')?.textContent.trim()
+  }
+})
+console.log(`selected in menu: ${JSON.stringify(afterTwo.selected)}`)
+console.log(`picker reads "${afterTwo.picker}"`)
+if (afterTwo.selected.length !== 2) console.log(`!! expected 2 selected rows, got ${afterTwo.selected.length}`)
+if (afterTwo.picker !== '2 triggers') console.log(`!! the picker does not summarise the count (got "${afterTwo.picker}")`)
+await shot('preview-multi.png')
+
+// Close the menu and leave manage mode.
+await page.click('.hermes-sb-picker')
+await page.waitForTimeout(150)
 await page.click('.hermes-sb-panel button[aria-label="Done"]')
 await page.waitForTimeout(200)
 const boundPads = await page.$$eval('.hermes-sb-pad[data-bound="true"]', nodes => nodes.length)
-console.log(`bound pads after binding one: ${boundPads}`)
-if (boundPads !== 1) console.log('!! the binding did not mark a pad')
+console.log(`bound pads after binding one pad to two triggers: ${boundPads}`)
+if (boundPads !== 1) console.log(`!! expected exactly 1 bound pad, got ${boundPads}`)
 
 await page.evaluate(() => {
   for (const listener of (window.__events['approval.request'] ?? [])) {
@@ -430,6 +457,21 @@ const flashed = await page.$$eval('.hermes-sb-pad[data-active="true"]', nodes =>
 console.log(`pads flashed by approval.request: ${JSON.stringify(flashed)}`)
 if (flashed.length !== 1) console.log('!! the bound sound did not fire in a real browser')
 await shot('preview-triggered.png')
+
+// The SECOND trigger on the same pad must fire it too.
+const eventKeys = await page.evaluate(() => Object.keys(window.__events ?? {}))
+console.log(`subscribed events: ${JSON.stringify(eventKeys)}`)
+await page.evaluate(() => {
+  for (const listener of (window.__events['message.complete'] ?? [])) {
+    listener({ type: 'message.complete', payload: { status: 'complete', text: 'done' } })
+  }
+})
+await page.waitForTimeout(120)
+const flashedAgain = await page.$$eval('.hermes-sb-pad[data-active="true"]', nodes =>
+  nodes.map(node => node.querySelector('.hermes-sb-pad-name')?.textContent)
+)
+console.log(`pads flashed by message.complete: ${JSON.stringify(flashedAgain)}`)
+if (flashedAgain.length !== 1) console.log('!! the second trigger did not fire the same pad')
 
 // Settings page.
 await page.evaluate(() => window.__mountSettings())

@@ -542,14 +542,22 @@ const pickerFor = name => [...(panel()?.querySelectorAll('.hermes-sb-picker') ??
   (picker.getAttribute('aria-label') ?? '').endsWith(name)
 )
 const rowFor = name => rows().find(row => row.querySelector('.hermes-sb-row-name')?.value === name)
-/** Open a row's trigger menu, click the named trigger, and let React settle. */
-const bindVia = (name, triggerLabel) => {
+/** Open a row's trigger menu, click one or more triggers, then close it.
+ *  The menu STAYS OPEN across clicks (multi-select), so closing is explicit. */
+const bindVia = (name, ...triggerLabels) => {
   click(pickerFor(name))
-  const menu = panel().querySelector('.hermes-sb-menu')
-  if (!menu) throw new Error('the trigger menu did not open')
-  const row = [...menu.querySelectorAll('.hermes-sb-menu-row')].find(item => item.textContent.trim() === triggerLabel)
-  if (!row) throw new Error(`no "${triggerLabel}" row in the menu`)
-  click(row)
+  if (!panel().querySelector('.hermes-sb-menu')) throw new Error('the trigger menu did not open')
+  for (const label of triggerLabels) {
+    // Re-query each time: React replaces the menu node on every toggle.
+    const row = [...panel().querySelectorAll('.hermes-sb-menu-row')].find(
+      item => item.querySelector('.hermes-sb-menu-text')?.textContent.trim() === label
+    )
+    if (!row) throw new Error(`no "${label}" row in the menu`)
+    click(row)
+  }
+  // Close by toggling the picker itself. Escape is not usable here: the
+  // popover's own handler closes the WHOLE panel on it, not just this menu.
+  click(pickerFor(name))
 }
 
 click(iconButton('Manage sounds'))
@@ -563,12 +571,15 @@ check('the picker renders its list in the DOM, not as a native select', () => {
   const menu = panel().querySelector('.hermes-sb-menu')
   if (!menu) throw new Error('no in-DOM menu')
   const rowsInMenu = menu.querySelectorAll('.hermes-sb-menu-row')
-  if (rowsInMenu.length < 15) throw new Error(`only ${rowsInMenu.length} rows`)
+  if (rowsInMenu.length !== 14) throw new Error(`expected 14 trigger rows, got ${rowsInMenu.length}`)
   const groups = menu.querySelectorAll('.hermes-sb-menu-group')
   if (groups.length < 4) throw new Error(`only ${groups.length} groups`)
   click(pickerFor('Pop'))
 })
 check('the menu is opaque — it carries its own background, not the page behind it', () => {
+  // The previous check may have left Pop's menu open; the picker is a toggle,
+  // so close it first and open deliberately.
+  if (panel().querySelector('.hermes-sb-menu')) click(pickerFor('Pop'))
   click(pickerFor('Pop'))
   const menu = panel().querySelector('.hermes-sb-menu')
   const style = window.getComputedStyle(menu)
@@ -584,15 +595,72 @@ bindVia('Pop', 'Approval needed')
 check('binding a trigger persists on the sound', () => {
   const saved = JSON.parse(storage.get('sounds'))
   const pop = saved.find(sound => sound.name === 'Pop')
-  if (pop.trigger !== 'attention.approval') throw new Error(`trigger=${pop.trigger}`)
+  if (JSON.stringify(pop.triggers) !== JSON.stringify(['attention.approval'])) {
+    throw new Error(`triggers=${JSON.stringify(pop.triggers)}`)
+  }
 })
+
+// ── multiple triggers on one sound ──────────────────────────────────────
+bindVia('Ding', 'Turn finishes', 'Turn fails', 'Question asked')
+check('one sound can hold several triggers', () => {
+  const saved = JSON.parse(storage.get('sounds'))
+  const ding = saved.find(sound => sound.name === 'Ding')
+  const expected = ['turn.complete', 'turn.error', 'attention.clarify']
+  if (JSON.stringify(ding.triggers) !== JSON.stringify(expected)) {
+    throw new Error(`triggers=${JSON.stringify(ding.triggers)}`)
+  }
+})
+check('a multi-bound picker summarises as a count', () => {
+  const picker = pickerFor('Ding')
+  const label = picker.querySelector('.hermes-sb-picker-label')?.textContent.trim()
+  if (label !== '3 triggers') throw new Error(`label is "${label}"`)
+
+})
+check('the menu marks every bound trigger as selected', () => {
+  click(pickerFor('Ding'))
+  const menu = panel().querySelector('.hermes-sb-menu')
+  const selected = [...menu.querySelectorAll('.hermes-sb-menu-row[data-selected=true]')].map(
+    row => row.querySelector('.hermes-sb-menu-text')?.textContent.trim()
+  )
+  if (JSON.stringify(selected) !== JSON.stringify(['Turn finishes', 'Turn fails', 'Question asked'])) {
+    throw new Error(`selected=${JSON.stringify(selected)}`)
+  }
+})
+check('clicking a bound trigger again removes just that one', () => {
+  const menu = panel().querySelector('.hermes-sb-menu')
+  const row = [...menu.querySelectorAll('.hermes-sb-menu-row')].find(
+    item => item.querySelector('.hermes-sb-menu-text')?.textContent.trim() === 'Turn fails'
+  )
+  click(row)
+  const saved = JSON.parse(storage.get('sounds'))
+  const ding = saved.find(sound => sound.name === 'Ding')
+  if (JSON.stringify(ding.triggers) !== JSON.stringify(['turn.complete', 'attention.clarify'])) {
+    throw new Error(`triggers=${JSON.stringify(ding.triggers)}`)
+  }
+  const still = panel().querySelector('.hermes-sb-menu')
+  if (!still) throw new Error('the menu closed on a toggle; multi-select needs it open')
+})
+check('the menu offers a clear-all row once anything is bound', () => {
+  const clear = panel().querySelector('.hermes-sb-menu-clear')
+  if (!clear) throw new Error('no clear row')
+  click(clear)
+  const saved = JSON.parse(storage.get('sounds'))
+  const ding = saved.find(sound => sound.name === 'Ding')
+  if (ding.triggers !== undefined) throw new Error(`triggers=${JSON.stringify(ding.triggers)}`)
+})
+check('with everything cleared the picker reads Never again', () => {
+  const label = pickerFor('Ding').querySelector('.hermes-sb-picker-label')?.textContent.trim()
+  if (label !== 'Never') throw new Error(`label is "${label}"`)
+})
+
+// restore a two-trigger binding for the firing tests below
+bindVia('Ding', 'Turn finishes', 'Question asked')
 check('a bound row is marked', () => {
   const picker = pickerFor('Pop')
   if (picker?.getAttribute('data-bound') !== 'true') throw new Error('picker not marked bound')
   if (picker.textContent.trim() !== 'Approval needed') throw new Error(`label is "${picker.textContent.trim()}"`)
 })
 
-bindVia('Ding', 'Turn finishes')
 click(iconButton('Done'))
 check('a bound pad shows a dot in the grid', () => {
   const bound = [...panel().querySelectorAll('.hermes-sb-pad')].filter(pad => pad.getAttribute('data-bound') === 'true')
@@ -637,13 +705,15 @@ check('the readout clears when a trigger fired nothing', () => {
   if (panel().querySelector('.hermes-sb-last')) throw new Error('stale readout survived')
 })
 
-// Unbinding returns the pad to click-only.
+// Unbinding returns the pad to click-only. With multi-select there is no
+// "Never" row to pick — clearing is its own action in the menu.
 click(iconButton('Manage sounds'))
-bindVia('Ding', 'Never')
-check('choosing "never" clears the binding', () => {
+click(pickerFor('Ding'))
+click(panel().querySelector('.hermes-sb-menu-clear'))
+check('clearing bindings removes them from the sound', () => {
   const saved = JSON.parse(storage.get('sounds'))
   const ding = saved.find(sound => sound.name === 'Ding')
-  if (ding.trigger !== undefined) throw new Error(`trigger still ${ding.trigger}`)
+  if (ding.triggers !== undefined) throw new Error(`triggers still ${JSON.stringify(ding.triggers)}`)
 })
 const afterUnbind = audioLog.oscillators
 await emit('message.complete', { status: 'complete' })
@@ -692,12 +762,63 @@ const third = makeCtx()
 plugin.register(third.ctx)
 const thirdChip = third.contributions.find(item => item.area === 'statusBar.right')
 const thirdMount = mount(thirdChip.render())
+// Migration: everything the previous version wrote stored `trigger: "id"`.
+// Drive it through a real load rather than reaching into the sanitizer, so the
+// test covers the path the app actually takes.
+storage.set('sounds', JSON.stringify([
+  { id: 'oldpop', name: 'Old Pop', kind: 'synth', synth: 'pop', trigger: 'turn.complete' },
+  { id: 'oldding', name: 'Old Ding', kind: 'synth', synth: 'ding' }
+]))
+storage.set('settings', JSON.stringify({ volume: 55 }))
+thirdMount.unmount()
+third.dispose()
+const fourth = makeCtx()
+plugin.register(fourth.ctx)
+const fourthMount = mount(fourth.contributions.find(item => item.area === 'statusBar.right').render())
+click(fourthMount.host.querySelector('button'))
+check('a legacy single-trigger save is migrated to a list', () => {
+  const pads = [...fourthMount.host.querySelectorAll('.hermes-sb-pad')].filter(pad => pad.getAttribute('data-bound') === 'true')
+  if (pads.length !== 1) throw new Error(`${pads.length} pads read as bound; expected the legacy one only`)
+  if (!pads[0].textContent.includes('Old Pop')) throw new Error(`wrong pad bound: ${pads[0].textContent}`)
+})
+await emit('message.complete', { status: 'complete' })
+check('a migrated binding still fires', () => {
+  const active = [...fourthMount.host.querySelectorAll('.hermes-sb-pad[data-active="true"]')]
+  if (active.length !== 1) throw new Error(`${active.length} pads flashed after migrating`)
+  if (!active[0].textContent.includes('Old Pop')) throw new Error('wrong pad fired')
+})
+check('a corrupt trigger list is filtered down to known ids', () => {
+  storage.set('sounds', JSON.stringify([
+    { id: 'x', name: 'X', kind: 'synth', synth: 'pop', triggers: ['turn.complete', 'nonsense', 'turn.complete', 42] }
+  ]))
+  fourthMount.unmount()
+  fourth.dispose()
+  const fifth = makeCtx()
+  plugin.register(fifth.ctx)
+  const fifthMount = mount(fifth.contributions.find(item => item.area === 'statusBar.right').render())
+  click(fifthMount.host.querySelector('button'))
+  const pad = fifthMount.host.querySelector('.hermes-sb-pad')
+  if (pad.getAttribute('data-bound') !== 'true') throw new Error('known id was dropped')
+  if (!/Turn finishes/.test(pad.getAttribute('title') ?? '')) throw new Error(`title=${pad.getAttribute('title')}`)
+  if (/nonsense|42/.test(pad.getAttribute('title') ?? '')) throw new Error('unknown id survived cleaning')
+  fifthMount.unmount()
+  fifth.dispose()
+})
+
+// Corrupt storage must not break the plugin: after the garbage above, the
+// built-in set comes back.
+storage.set('sounds', '{"nope":true}')
+storage.set('settings', '"garbage"')
+const sixth = makeCtx()
+plugin.register(sixth.ctx)
+const sixthMount = mount(sixth.contributions.find(item => item.area === 'statusBar.right').render())
+click(sixthMount.host.querySelector('button'))
 check('corrupt storage falls back to the built-ins', () => {
-  click(thirdMount.host.querySelector('button'))
-  const count = thirdMount.host.querySelectorAll('.hermes-sb-pad .hermes-sb-pad-name').length
+  const count = sixthMount.host.querySelectorAll('.hermes-sb-pad .hermes-sb-pad-name').length
   if (count !== 7) throw new Error(`expected 7 fallback pads, got ${count}`)
 })
-third.dispose()
+sixthMount.unmount()
+sixth.dispose()
 
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 
