@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8">
+<script src="/bundle.js"></script>
+<script type="module">
+import React from '/react.js'
+import * as ReactDOMClient from '/react-dom.js'
+window.React = React.default ?? React
+window.ReactDOMClient = ReactDOMClient
+window.addEventListener('load', () => { window.__mount(document.getElementById('host')) })
+</script>
+</head><body><div id="host"></div></body></html>

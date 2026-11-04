@@ -35,6 +35,72 @@ fs.mkdirSync(outDir, { recursive: true })
 
 // The preview entry: mount the chip into a fake status bar, with a context that
 // behaves like the host's (storage, files, i18n, contributions).
+// A genuinely playable clip, generated here: a 0.4s 440Hz mono WAV. Embedding a
+// real base64 blob would bloat the source and tie the test to one machine; a
+// synthesised WAV decodes in any browser and is enough to prove playback.
+function makeWavBase64(seconds = 0.4, rate = 22050, freq = 440) {
+  const samples = Math.floor(seconds * rate)
+  const buf = Buffer.alloc(44 + samples * 2)
+  buf.write('RIFF', 0)
+  buf.writeUInt32LE(36 + samples * 2, 4)
+  buf.write('WAVE', 8)
+  buf.write('fmt ', 12)
+  buf.writeUInt32LE(16, 16)
+  buf.writeUInt16LE(1, 20)
+  buf.writeUInt16LE(1, 22)
+  buf.writeUInt32LE(rate, 24)
+  buf.writeUInt32LE(rate * 2, 28)
+  buf.writeUInt16LE(2, 32)
+  buf.writeUInt16LE(16, 34)
+  buf.write('data', 36)
+  buf.writeUInt32LE(samples * 2, 40)
+  for (let i = 0; i < samples; i += 1) {
+    const v = Math.sin((2 * Math.PI * freq * i) / rate) * 0.3 * 32767
+    buf.writeInt16LE(Math.round(v), 44 + i * 2)
+  }
+  return buf.toString('base64')
+}
+// Prefer a real mp3 (matching what the import actually stores); fall back to a
+// synthesised WAV so the suite still runs on a machine without ffmpeg.
+async function makeMp3Base64() {
+  const fsx = fs
+
+  const { tmpdir } = await import('node:os')
+  const dir = fsx.mkdtempSync(path.join(tmpdir(), 'sbclip-'))
+  const wav = path.join(dir, 'a.wav')
+  const mp3 = path.join(dir, 'a.mp3')
+  try {
+    fsx.writeFileSync(wav, Buffer.from(makeWavBase64(0.6), 'base64'))
+    const { execFileSync } = await import('node:child_process')
+    execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', wav, '-b:a', '64k', mp3], { stdio: 'ignore' })
+    return fsx.readFileSync(mp3).toString('base64')
+  } catch {
+    return null
+  } finally {
+    fsx.rmSync(dir, { recursive: true, force: true })
+  }
+}
+// Prefer the clip a real import produced on this machine: it is the artefact
+// that failed. Falls back to a generated mp3, then a WAV, so the suite runs
+// anywhere.
+function realStoredClip() {
+  try {
+    const dir = path.join(process.env.APPDATA || '', 'Hermes/plugin-files/data/hermes-soundboard')
+    if (!fs.existsSync(dir)) return null
+    const b64 = fs.readdirSync(dir).filter(n => n.endsWith('.b64'))
+    for (const name of b64) {
+      const text = fs.readFileSync(path.join(dir, name), 'utf8').replace(/\s+/g, '')
+      if (text.length > 2000) return text
+    }
+  } catch {}
+  return null
+}
+const STORED = realStoredClip()
+if (STORED) console.log(`test clip: real stored clip (${STORED.length} chars)`)
+const MP3_B64 = STORED ?? (await makeMp3Base64())
+const WAV_B64 = MP3_B64 ?? makeWavBase64()
+console.log(`test clip: ${MP3_B64 ? 'real mp3' : 'synthesised wav'}`)
+
 fs.writeFileSync(
   entryPath,
   `
@@ -45,6 +111,9 @@ import { registerPluginI18n } from ${JSON.stringify(path.join(here, 'sdk-stub.mj
 
 // shell.exec is session-bound; stand in for an open chat.
 window.__hermesTestSessionId = 'preview-session'
+// A REAL 2.3s mp3 (base64), so the import's result can actually be played and
+// not merely rendered. Fake bytes would make every playback assertion vacuous.
+window.__realClip = ${JSON.stringify(WAV_B64)}
 const memory = new Map()
 // The plugin's data folder, emulated: path -> text/marker.
 window.__files = new Map()
@@ -111,7 +180,7 @@ const ctx = {
     },
     readDataUrl: async (_folder, path) =>
       path.endsWith('.mp3')
-        ? { ok: true, url: 'data:audio/mpeg;base64,' + btoa('FAKE-MP3-CLIP'.repeat(60)) }
+        ? { ok: true, url: 'data:audio/mpeg;base64,' + window.__realClip }
         : { ok: false, error: 'not-found', message: path },
     trash: async (_folder, path) => {
       window.__files.delete(path)
@@ -601,6 +670,48 @@ if (!/%%\(ext\)s/.test(ytState.script)) console.log('!! the output template is n
 if (ytState.leftovers.length) console.log(`!! job files left behind: ${ytState.leftovers.join(', ')}`)
 console.log(`shell calls: ${ytState.shellCalls.length}`)
 await shot('preview-youtube-done.png')
+
+// ── the imported pad must actually PLAY ─────────────────────────────────
+// The reported bug was "it appears but no sound", so appearing is not enough.
+// This clicks the new pad in the real panel and waits for audio time to move.
+const playState = await page.evaluate(async () => {
+  const pads = [...document.querySelectorAll('.hermes-sb-pad')]
+  const pad = pads.find(p => /^YouTube/.test(p.querySelector('.hermes-sb-pad-name')?.textContent ?? ''))
+  if (!pad) return { error: 'no YouTube pad' }
+  // Observe by monkey-patching the constructor to RETURN a plain Audio we keep
+  // a handle on. Subclassing a media element is not guaranteed to preserve its
+  // internal load behaviour, which is exactly the kind of test artefact that
+  // produces a false failure.
+  const made = []
+  const Real = window.Audio
+  window.Audio = function (src) {
+    const a = new Real(src)
+    made.push(a)
+    window.__lastSrc = String(src)
+    return a
+  }
+  pad.click()
+  await new Promise(r => setTimeout(r, 700))
+  window.Audio = Real
+  const a = made[0]
+  if (!a) return { error: 'no Audio constructed' }
+  return {
+    constructed: made.length,
+    srcPrefix: (window.__lastSrc || '').slice(0, 44),
+    srcLen: (window.__lastSrc || '').length,
+    clipDefined: typeof window.__realClip,
+    volume: a.volume,
+    duration: a.duration,
+    currentTime: a.currentTime,
+    paused: a.paused,
+    readyState: a.readyState,
+    errorCode: a.error ? a.error.code : null
+  }
+})
+console.log(`imported pad playback: ${JSON.stringify(playState)}`)
+if (playState.error) console.log(`!! ${playState.error}`)
+else if (!(playState.currentTime > 0)) console.log('!! the pad produced no audible progress')
+else console.log(`  audible: advanced to ${playState.currentTime.toFixed(2)}s of ${(playState.duration || 0).toFixed(2)}s`)
 
 // The field closes on success.
 const fieldOpen = await page.$('.hermes-sb-yt-input')

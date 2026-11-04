@@ -826,14 +826,49 @@ function createEngine(ctx) {
     const audio = new Audio(url)
     audio.volume = Math.max(0, Math.min(1, gain))
     playing.add(audio)
+
+    // Every failure below used to be swallowed: the pad flashed (so it looked
+    // like it played), nothing was audible, and nothing was reported. A clip
+    // that fails to decode must say so — that is the only way the difference
+    // between "broken file", "blocked autoplay" and "volume at zero" is even
+    // visible to the person clicking.
+    const failed = new Promise(resolve => {
+      audio.addEventListener('error', () => {
+        const err = audio.error
+        resolve(
+          new Error(
+            err ? t('playError').replace('{code}', String(err.code)) : t('playError').replace('{code}', '?')
+          )
+        )
+      }, { once: true })
+      audio.addEventListener('ended', () => resolve(null), { once: true })
+      // A clip that never even reaches canplay is its own failure, and silence
+      // would otherwise last forever.
+      setTimeout(() => resolve(audio.readyState === 0 ? new Error(t('decodeFailed')) : null), 4000)
+    })
+
     const release = () => {
       playing.delete(audio)
       audio.src = ''
     }
     audio.addEventListener('ended', release, { once: true })
     audio.addEventListener('error', release, { once: true })
-    if (gain <= 0) return
-    await audio.play().catch(release)
+
+    if (gain <= 0) throw new Error(t('volumeZero'))
+
+    try {
+      await audio.play()
+    } catch (error) {
+      release()
+      throw new Error(
+        error?.name === 'NotAllowedError'
+          ? t('blockedAutoplay')
+          : `${t('decodeFailed')} (${error?.name || 'error'})`
+      )
+    }
+
+    const problem = await failed
+    if (problem) throw problem
   }
 
   function play(sound) {
@@ -841,7 +876,11 @@ function createEngine(ctx) {
     flash(sound.id)
     const gain = settings.get().volume / 100
     if (sound.kind === 'synth') playSynth(sound.synth, gain)
-    else void playFile(sound, gain).catch(error => ctx.notify?.({ kind: 'error', message: String(error.message || error) }))
+    else {
+      void playFile(sound, gain).catch(error =>
+        ctx.notify?.({ kind: 'error', message: String(error?.message || error) })
+      )
+    }
   }
 
   // Triggered playback is different from a click: the window is usually NOT
@@ -2080,6 +2119,10 @@ const LOCALES = {
     ytNoFfmpeg: 'ffmpeg was not found on PATH — yt-dlp needs it to make an mp3.',
     ytNoShell: 'Hermes refused to run the converter.',
     ytNoSession: 'Open a chat first — the converter runs inside the session that is currently open.',
+    playError: 'That clip could not be decoded (audio error {code}).',
+    decodeFailed: 'That clip did not start playing.',
+    blockedAutoplay: 'Hermes blocked the audio. Click the pad again.',
+    volumeZero: 'Volume is at 0 — turn the slider up.',
     ytTooLong: 'That video is {secs}s long. Soundboard clips are capped at 30s — pick a shorter one.',
     ytTimeout: 'The converter stopped without reporting back. Check that ffmpeg is on PATH, then try again.',
     ytFailed: 'The conversion failed.',
@@ -2125,6 +2168,10 @@ const LOCALES = {
     ytNoFfmpeg: 'Nie znaleziono ffmpeg w PATH — yt-dlp potrzebuje go do mp3.',
     ytNoShell: 'Hermes odmówił uruchomienia konwertera.',
     ytNoSession: 'Najpierw otwórz czat — konwerter działa w obrębie otwartej sesji.',
+    playError: 'Nie udało się zdekodować klipu (błąd audio {code}).',
+    decodeFailed: 'Klip nie zaczął się odtwarzać.',
+    blockedAutoplay: 'Hermes zablokował dźwięk. Kliknij podkładkę jeszcze raz.',
+    volumeZero: 'Głośność jest na 0 — podnieś suwak.',
     ytTooLong: 'Ten film ma {secs}s. Klipy dźwiękowe są ograniczone do 30s — wybierz krótszy.',
     ytTimeout: 'Konwerter zatrzymał się bez odpowiedzi. Sprawdź, czy ffmpeg jest w PATH, i spróbuj ponownie.',
     ytFailed: 'Konwersja nie powiodła się.',
@@ -2159,6 +2206,9 @@ export default {
     ctx.onDispose(() => style.remove())
 
     const engine = createEngine(ctx)
+    // Test hook: lets the harness drive the engine directly (playback failure
+    // reporting is unreachable from the DOM when the stub Audio never emits).
+    ctx.__engine = engine
 
     ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 20, render: () => jsx(Chip, { engine }) })
 

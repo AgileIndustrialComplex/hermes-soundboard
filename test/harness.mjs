@@ -886,6 +886,26 @@ check('the job leftovers are cleaned up after a success', () => {
   if (leftovers.length) throw new Error(`left behind: ${leftovers.join(', ')}`)
 })
 
+// ── playback failures must be visible ───────────────────────────────────
+// The reported symptom — pad flashes, no sound, no error — was reachable
+// because playFile swallowed everything. This pins the reporting path.
+check('playing at zero volume reports instead of going silent', () => {
+  const engine = ytCtx.ctx.__engine
+  const before = notifications.length
+  engine.settings.set({ ...engine.settings.get(), volume: 0 })
+  const fileSound = engine.sounds.get().find(s => s.kind === 'file')
+  if (!fileSound) throw new Error('no file pad to play')
+  engine.play(fileSound)
+  engine.settings.set({ ...engine.settings.get(), volume: 80 })
+  if (!notifications.slice(before).length) {
+    // The volume guard throws synchronously inside playFile's promise; a tick
+    // is needed for the catch to run.
+    return new Promise(resolve => setTimeout(resolve, 80)).then(() => {
+      if (!notifications.slice(before).length) throw new Error('no warning raised at volume 0')
+    })
+  }
+})
+
 ytMount.unmount()
 ytCtx.dispose()
 // The import added a pad to the shared storage; later checks count pads, so

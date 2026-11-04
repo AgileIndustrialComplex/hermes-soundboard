@@ -167,6 +167,13 @@ one's `backdrop-filter`, and the suite asserts the menu is inside the panel box
 and at least 200px wide. Both assertions were verified to fail on a
 deliberately reverted build.
 
+**On playback failures.** `playFile` used to swallow everything: the pad
+flashed, nothing was audible, and no message appeared — indistinguishable from
+"the file is broken", "autoplay was blocked" or "the volume is at zero". It now
+raises a host toast naming which of those it was (decode error code, blocked
+playback, or a zero volume), because silence with no explanation is a bug in its
+own right.
+
 **On autoplay.** A triggered sound plays while the window may be unfocused, so
 the WebAudio context can be suspended by the browser's autoplay policy. Every
 trigger attempts a resume; if the platform refuses, the pad still lights up, so
