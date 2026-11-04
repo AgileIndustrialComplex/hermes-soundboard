@@ -734,6 +734,137 @@ check('Escape closes the panel', () => {
   if (panel()) throw new Error('panel still mounted')
 })
 
+/* ── 7b. YouTube import ─────────────────────────────────────────────────── */
+
+// jsdom reports a Linux UA; the plugin's job pipeline is written for Windows
+// (cmd, start /b, doubled %). Force that branch for these tests.
+globalThis.__hermesForceWindows = true
+const storageBeforeYt = new Map(storage)
+const filesBeforeYt = new Map(files)
+// Each scenario below needs a fresh tool probe.
+const resetTools = () => globalThis.__hermesResetTools?.()
+
+// The import is a detached job watched through files, so the harness fakes the
+// job by having `shell.exec` write what the real one would: a script, then an
+// mp3, then the status file — at whichever moment the test chooses.
+// The stub is bundled into the plugin, so `host` is not reachable from here.
+// It delegates to this global, which is what the tests swap.
+const stubShell = handler => {
+  globalThis.__hermesHostRequest = handler
+}
+const ytFiles = () => [...files.keys()]
+
+chip.unmount()
+boot.dispose()
+
+const ytCtx = makeCtx()
+plugin.register(ytCtx.ctx)
+const ytMount = mount(ytCtx.contributions.find(item => item.area === 'statusBar.right').render())
+click(ytMount.host.querySelector('button'))
+
+const linkButton = () => ytMount.host.querySelector('.hermes-sb-panel button[aria-label="Import from YouTube"]')
+check('the import control lives in the panel header', () => {
+  if (!linkButton()) throw new Error('no YouTube button')
+})
+click(linkButton())
+const urlInput = () => ytMount.host.querySelector('.hermes-sb-yt-input')
+check('opening it reveals a single URL field', () => {
+  if (!urlInput()) throw new Error('no input')
+  if (urlInput().type !== 'text') throw new Error(`type=${urlInput().type}`)
+})
+
+// --- a refused URL never reaches the shell ---
+let shellCalls = 0
+stubShell(async () => {
+  shellCalls += 1
+  return { blocked: false, code: 0, stdout: '' }
+})
+typeInto(urlInput(), 'https://vimeo.com/12345')
+const goButton = () => ytMount.host.querySelector('.hermes-sb-yt-go')
+click(goButton())
+await new Promise(resolve => setTimeout(resolve, 120))
+check('a non-YouTube link is refused before any process runs', () => {
+  const note = ytMount.host.querySelector('.hermes-sb-yt-note[data-error="true"]')
+  if (!note) throw new Error('no error shown')
+  if (shellCalls !== 0) throw new Error(`the shell ran ${shellCalls} times`)
+})
+
+// --- a missing tool explains itself ---
+resetTools()
+stubShell(async (method, params) => {
+  const command = params?.command ?? ''
+  if (/where ffmpeg/.test(command)) return { blocked: false, code: 0, stdout: 'ffmpeg=0\nuvx=1\n' }
+  return { blocked: false, code: 0, stdout: '' }
+})
+typeInto(urlInput(), 'https://youtu.be/jNQXAC9IVRw')
+click(goButton())
+await new Promise(resolve => setTimeout(resolve, 200))
+check('a missing ffmpeg is reported, not silently ignored', () => {
+  const note = ytMount.host.querySelector('.hermes-sb-yt-note[data-error="true"]')
+  if (!note) throw new Error('no error shown')
+  if (!/ffmpeg/i.test(note.textContent)) throw new Error(`note=${note.textContent}`)
+})
+
+// --- the happy path: tools present, duration short, job completes ---
+resetTools()
+const scriptWrites = []
+stubShell(async (method, params) => {
+  const command = params?.command ?? ''
+  if (/where ffmpeg/.test(command)) return { blocked: false, code: 0, stdout: 'ffmpeg=1\nuvx=1\n' }
+  if (/--print duration/.test(command)) return { blocked: false, code: 0, stdout: '19\n' }
+  return { blocked: false, code: 0, stdout: '' }
+})
+// Pretend the detached job finished: the script the plugin wrote is in `files`,
+// so the harness can supply the mp3 and the status file it would have produced.
+const realWrite = ytCtx.ctx.files.writeText
+ytCtx.ctx.files.writeText = async (folder, path, text, opts) => {
+  const out = await realWrite(folder, path, text, opts)
+  if (path.endsWith('.cmd')) {
+    scriptWrites.push({ path, text })
+    // yt-dlp would now run; stand in for it.
+    const stem = path.replace(/^\./, '').replace(/\.cmd$/, '')
+    files.set(`${stem}.mp3`, 'FAKE-MP3')
+    files.set(`${path.replace(/^\./, '.').replace(/\.cmd$/, '.status')}`, 'ok')
+  }
+  return out
+}
+ytCtx.ctx.files.readDataUrl = async (_folder, path) => {
+  if (path.endsWith('.mp3')) return { ok: true, url: 'data:audio/mpeg;base64,' + Buffer.from('FAKE-MP3'.repeat(40)).toString('base64') }
+  return { ok: false, error: 'not-found', message: path }
+}
+
+const ytPadsBefore = ytMount.host.querySelectorAll('.hermes-sb-pad').length
+typeInto(urlInput(), 'https://www.youtube.com/watch?v=jNQXAC9IVRw')
+click(goButton())
+// The poll interval is 700ms, so give the stub job a couple of ticks.
+await new Promise(resolve => setTimeout(resolve, 2600))
+
+check('a valid link writes a job script, runs it, and lands a pad', () => {
+  if (!scriptWrites.length) throw new Error('no job script was written')
+  if (!/uvx yt-dlp/.test(scriptWrites[0].text)) throw new Error('the script does not call uvx yt-dlp')
+  if (!/%%\(ext\)s/.test(scriptWrites[0].text)) throw new Error('the output template is not batch-escaped')
+
+  const after = ytMount.host.querySelectorAll('.hermes-sb-pad').length
+  if (after !== ytPadsBefore + 1) throw new Error(`${after - ytPadsBefore} pads added`)
+  const saved = JSON.parse(storage.get('sounds'))
+  const yt = saved.find(sound => /^YouTube/.test(sound.name))
+  if (!yt) throw new Error(`no YouTube pad in ${saved.map(s => s.name).join(', ')}`)
+  if (yt.mime !== 'audio/mpeg') throw new Error(`mime=${yt.mime}`)
+})
+
+check('the job leftovers are cleaned up after a success', () => {
+  const leftovers = ytFiles().filter(name => /\.(cmd|log|status)$/.test(name))
+  if (leftovers.length) throw new Error(`left behind: ${leftovers.join(', ')}`)
+})
+
+ytMount.unmount()
+ytCtx.dispose()
+// The import added a pad to the shared storage; later checks count pads, so
+// restore the exact pre-test state instead of leaking a change forward.
+for (const [key, value] of storageBeforeYt) storage.set(key, value)
+for (const [key, value] of filesBeforeYt) files.set(key, value)
+for (const key of [...files.keys()]) if (!filesBeforeYt.has(key)) files.delete(key)
+
 /* ── 8. persistence across a reload ────────────────────────────────────── */
 
 chip.unmount()

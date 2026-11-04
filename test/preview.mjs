@@ -44,6 +44,18 @@ import plugin from ${JSON.stringify(path.join(root, 'plugin.js').replace(/\\/g, 
 import { registerPluginI18n } from ${JSON.stringify(path.join(here, 'sdk-stub.mjs').replace(/\\/g, '/'))}
 
 const memory = new Map()
+// The plugin's data folder, emulated: path -> text/marker.
+window.__files = new Map()
+// plugin.js calls host.request from the SDK stub, which refuses unless a
+// handler is registered here. Stand in for the gateway's shell door.
+window.__shellCalls = []
+window.__hermesHostRequest = async (method, params) => {
+  const command = params?.command ?? ''
+  if (/where ffmpeg/.test(command)) return { blocked: false, code: 0, stdout: 'ffmpeg=1\\nuvx=1\\n' }
+  if (/--print duration/.test(command)) return { blocked: false, code: 0, stdout: '19\\n' }
+  window.__shellCalls.push(command)
+  return { blocked: false, code: 0, stdout: '' }
+}
 const contributions = {}
 let settingsPage = null
 
@@ -64,9 +76,30 @@ const ctx = {
   },
   files: {
     dataFolder: 'data',
-    readText: async () => ({ ok: false, error: 'not-found', message: 'no clip' }),
-    writeText: async () => ({ ok: false, error: 'io-error', message: 'preview is read-only' }),
-    trash: async () => ({ ok: true }),
+    readText: async (_folder, path) =>
+      window.__files.has(path)
+        ? { ok: true, text: window.__files.get(path), size: window.__files.get(path).length, mtimeMs: 0 }
+        : { ok: false, error: 'not-found', message: 'no ' + path },
+    writeText: async (_folder, path, text) => {
+      window.__files.set(path, text)
+      // Stand in for the detached job: as soon as the script lands, produce the
+      // mp3 and the status file it would write.
+      if (path.endsWith('.cmd')) {
+        const stem = path.replace(/^\./, '').replace(/\.cmd$/, '')
+        window.__files.set(stem + '.mp3', 'FAKE')
+        window.__files.set(path.replace(/\.cmd$/, '.status'), 'ok')
+        window.__script = text
+      }
+      return { ok: true, path, size: text.length, mtimeMs: 0 }
+    },
+    readDataUrl: async (_folder, path) =>
+      path.endsWith('.mp3')
+        ? { ok: true, url: 'data:audio/mpeg;base64,' + btoa('FAKE-MP3-CLIP'.repeat(60)) }
+        : { ok: false, error: 'not-found', message: path },
+    trash: async (_folder, path) => {
+      window.__files.delete(path)
+      return { ok: true }
+    },
     folders: async () => [],
     requestFolder: async () => ({ ok: false, error: 'unavailable', message: 'preview' })
   },
@@ -215,7 +248,12 @@ const browser = await chromium.launch({ executablePath: findChrome(), args: ['--
 const context = await browser.newContext({
   viewport: { width: 420, height: 560 },
   deviceScaleFactor: 2,
-  colorScheme: 'dark'
+  colorScheme: 'dark',
+  // The import pipeline branches on the platform (cmd / start / doubled %), so
+  // the page must look like the machine it targets. Without this the UI hides
+  // the feature and every import fails with "no plugin folder".
+  userAgent:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 })
 const page = await context.newPage()
 page.on('console', message => {
@@ -472,6 +510,45 @@ const flashedAgain = await page.$$eval('.hermes-sb-pad[data-active="true"]', nod
 )
 console.log(`pads flashed by message.complete: ${JSON.stringify(flashedAgain)}`)
 if (flashedAgain.length !== 1) console.log('!! the second trigger did not fire the same pad')
+
+// ── YouTube import, in a real browser ───────────────────────────────────
+// The panel's header button opens a field; submitting runs the whole pipeline
+// against the stubbed shell door and must land a pad.
+await page.click('.hermes-sb-panel button[aria-label="Import from YouTube"]')
+await page.waitForSelector('.hermes-sb-yt-input', { timeout: 3000 })
+await page.fill('.hermes-sb-yt-input', 'https://www.youtube.com/watch?v=jNQXAC9IVRw')
+await page.waitForTimeout(120)
+await shot('preview-youtube.png')
+
+await page.click('.hermes-sb-yt-go')
+// The job poll is 700ms per tick; the stub answers on the first one.
+await page.waitForFunction(() => {
+  const pads = [...document.querySelectorAll('.hermes-sb-pad-name')].map(node => node.textContent)
+  return pads.some(name => /^YouTube/.test(name))
+}, null, { timeout: 8000 }).catch(() => {})
+await page.waitForTimeout(400)
+
+const ytState = await page.evaluate(() => ({
+  pads: [...document.querySelectorAll('.hermes-sb-pad-name')].map(node => node.textContent),
+  script: window.__script ?? '',
+  shellCalls: window.__shellCalls ?? [],
+  leftovers: [...window.__files.keys()].filter(name => /\.(cmd|log|status)$/.test(name)),
+  error: document.querySelector('.hermes-sb-yt-note[data-error="true"]')?.textContent ?? ''
+}))
+const ytPad = ytState.pads.find(name => /^YouTube/.test(name))
+console.log(`youtube pad added: ${ytPad ? JSON.stringify(ytPad) : 'NO'}`)
+if (!ytPad) console.log(`!! the import did not add a pad (error: ${ytState.error || 'none'})`)
+if (ytState.error) console.log(`!! the field reported: ${ytState.error}`)
+if (!/uvx yt-dlp/.test(ytState.script)) console.log('!! no job script was written')
+if (!/%%\(ext\)s/.test(ytState.script)) console.log('!! the output template is not batch-escaped')
+if (ytState.leftovers.length) console.log(`!! job files left behind: ${ytState.leftovers.join(', ')}`)
+console.log(`shell calls: ${ytState.shellCalls.length}`)
+await shot('preview-youtube-done.png')
+
+// The field closes on success.
+const fieldOpen = await page.$('.hermes-sb-yt-input')
+console.log(`import field closed after success: ${!fieldOpen}`)
+if (fieldOpen) console.log('!! the field stayed open')
 
 // Settings page.
 await page.evaluate(() => window.__mountSettings())

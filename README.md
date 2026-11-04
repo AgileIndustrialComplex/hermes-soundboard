@@ -37,6 +37,9 @@ mode all persist per machine.
   audio files straight onto the panel. Each file is copied into the plugin's
   private data folder as base64 and read back into a `data:` URL on first play,
   so a custom pad survives restarts without the original file staying put.
+- **YouTube import.** The link button takes a YouTube URL (or a bare video id)
+  and adds it as an mp3 pad, through `yt-dlp` + `ffmpeg`. See
+  [YouTube import](#youtube-import).
 - **Manage mode.** The pencil button lists every pad with a preview button, a
   **"play when" trigger dropdown**, an inline rename field (Enter or blur
   commits, Escape reverts) and delete. Deleting a custom pad also trashes its
@@ -55,6 +58,39 @@ mode all persist per machine.
 - **⌘K command.** "Open Soundboard" from the command palette.
 - **Settings → Plugins → Soundboard.** Volume, whether the status-bar chip
   shows its label, and how many pads fit per row.
+
+## YouTube import
+
+Paste a link, get a pad. The link button in the panel header opens a one-field
+row; Enter or the arrow button starts the conversion, and the pad appears when
+it finishes — typically a few seconds for a short clip.
+
+- **What it needs.** `yt-dlp` and `ffmpeg`. yt-dlp is fetched on demand by
+  `uvx`, which ships with Hermes, so in practice only **ffmpeg** has to be on
+  `PATH`. Both are probed before the field is offered, and a missing one is
+  named in the error rather than failing silently.
+- **30-second cap.** A soundboard cue wants seconds, not a track. The duration
+  is checked before downloading anything; a longer video is refused with its
+  length in the message.
+- **3 MB cap** still applies (base64 in `ctx.files` doubles nothing, but
+  inflates by 4/3 against a 4 MiB text limit).
+
+### Why the job is a detached script
+
+The only process door a plugin has is `host.request('shell.exec')`, and it kills
+its child at 30 seconds. A conversion can take longer, so the plugin writes a
+`.cmd` script into its own data folder, launches it detached, and watches a
+status file. Three details are load-bearing and each was a real failure first:
+
+| Detail | Why |
+|---|---|
+| The script takes **no arguments** | `start /b cmd /c "script.cmd" "arg"` silently drops arguments — four forms were probed, all arrived empty. Every path is baked into the script instead |
+| `%` is **doubled** | `-o out.%(ext)s` — an unescaped `%` makes cmd refuse to parse the whole file (`File Not Found`), running no line at all |
+| Duration is probed **in the foreground** | `--match-filter "duration <= 30"` puts `<`/`>` in the command, which cmd eats as redirection even inside quotes; yt-dlp then reports "You must provide at least one URL" |
+
+The status file is the only channel back — `shell.exec` captures output at
+launch and the child is gone by then — so the job writes `ok`/`fail` when it
+finishes, and the plugin polls it.
 
 ## Triggers
 
@@ -135,6 +171,8 @@ the cue is never silently lost.
 ![The trigger picker open](shots/preview-menu.png)
 
 ![Two triggers on one pad](shots/preview-multi.png)
+
+![Importing from YouTube](shots/preview-youtube.png)
 
 | | |
 |---|---|

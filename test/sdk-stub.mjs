@@ -63,7 +63,17 @@ export const haptic = () => {}
 export const host = {
   state: { gateway: atom('open'), busy: atom(false), profile: atom('default') },
   notify: () => {},
-  navigate: () => {}
+  navigate: () => {},
+  // The gateway RPC door. esbuild INLINES this stub into the bundle, so the
+  // harness cannot swap `host.request` on a separately-imported copy — it hands
+  // a handler through this global instead, which every bundled caller sees.
+  request: async (method, params, timeoutMs) => {
+    const handler = globalThis.__hermesHostRequest
+    if (typeof handler !== 'function') {
+      throw new Error(`host.request(${method}) is not stubbed for this call`)
+    }
+    return handler(method, params, timeoutMs)
+  }
 }
 
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' }

@@ -15,6 +15,7 @@ import {
   atom,
   Button,
   haptic,
+  host,
   icons,
   Input,
   PALETTE_AREA,
@@ -36,6 +37,20 @@ const MAX_FILE_BYTES = 3 * 1024 * 1024
 const MAX_NAME_LEN = 24
 const MAX_SOUNDS = 40
 const FLASH_MS = 220
+
+// ── youtube import ────────────────────────────────────────────────────────
+// A YouTube link is converted to mp3 by yt-dlp (which needs ffmpeg for the
+// transcode). Neither ships with Hermes, so both are probed before the field
+// is offered — a URL box that always fails is worse than no URL box.
+//
+// The conversion runs as a DETACHED child, because the only process door a
+// plugin has is `host.request('shell.exec')` and it kills anything at 30s —
+// a 4-minute song takes longer than that. So the command starts the job and
+// returns in ~2s, and the plugin watches the job's status file. That file is
+// the only channel back: shell.exec captures output at launch and is gone.
+const YT_MAX_SECONDS = 30
+const YT_POLL_MS = 700
+const YT_TIMEOUT_MS = 180000
 
 const DEFAULT_SETTINGS = { volume: 80, showLabel: true, padsPerRow: 4 }
 
@@ -349,6 +364,209 @@ function cleanTriggers(value) {
   return TRIGGERS.filter(trigger => wanted.has(trigger.id)).map(trigger => trigger.id)
 }
 
+
+// ── youtube helpers ───────────────────────────────────────────────────────
+// Everything here is deliberately Windows-first but degrades to a clear error
+// rather than a silent no-op: the process door, the path separator, and the
+// detach syntax are all platform-specific, so each is chosen explicitly.
+
+/** The 11-character id out of any of YouTube's URL shapes, or null. */
+function parseYoutube(value) {
+  const text = String(value ?? '').trim()
+  if (!text) return null
+  // A bare id is accepted, so pasting just the code works.
+  if (/^[A-Za-z0-9_-]{11}$/.test(text)) return text
+  let url
+  try {
+    url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`)
+  } catch {
+    return null
+  }
+  const host = url.hostname.replace(/^www\./, '').toLowerCase()
+  if (host === 'youtu.be') {
+    return /^[A-Za-z0-9_-]{11}$/.test(url.pathname.slice(1)) ? url.pathname.slice(1) : null
+  }
+  if (host !== 'youtube.com' && host !== 'm.youtube.com' && host !== 'music.youtube.com') return null
+  const v = url.searchParams.get('v')
+  if (v && /^[A-Za-z0-9_-]{11}$/.test(v)) return v
+  // /shorts/<id>, /embed/<id>, /live/<id>
+  const m = url.pathname.match(/^\/(?:shorts|embed|live|v)\/([A-Za-z0-9_-]{11})/)
+  return m ? m[1] : null
+}
+
+/** Cached tool probe. Reset by the test harness through `__hermesResetTools`. */
+let toolsProbe = null
+
+class ImportError extends Error {
+  constructor(code, message) {
+    super(message)
+    this.code = code
+  }
+}
+
+// navigator.platform is deprecated and EMPTY in jsdom, and Electron does not
+// guarantee it either — so fall back to the UA, which both set. A plain
+// `navigator.platform` check silently reported "not Windows" under test and
+// every import failed with "no plugin folder", which reads like a permissions
+// problem rather than a platform probe that never matched.
+const IS_WINDOWS =
+  typeof navigator !== 'undefined' &&
+  /win/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '')
+
+/** jsdom reports "linux" and has no plugin-files bridge, so the harness sets
+ *  this to exercise the Windows path it was written for. Production code never
+ *  touches it. */
+function windowsHost() {
+  return IS_WINDOWS || globalThis.__hermesForceWindows === true
+}
+
+function joinNative(dir, name) {
+  return `${dir}${IS_WINDOWS ? '\\' : '/'}${name}`
+}
+
+/** `%APPDATA%\<ProductName>\plugin-files\data\<id>` — Electron's userData is
+ *  the app-name folder under Roaming on Windows, and `main` names it the
+ *  plugin id verbatim when the id is already lowercase (which it is).
+ *
+ *  Nothing exposes this path to a plugin: `ctx.files` speaks in relative
+ *  paths by design. We do not need the plugin's own path — we need the
+ *  POSITION of that folder, which is derivable, and the job writes only
+ *  inside the folder the plugin already has access to. */
+function dataDir() {
+  if (!windowsHost()) return null
+  // `%APPDATA%` is expanded by cmd inside the detached command, so the plugin
+  // never needs to know a real absolute path — and never gets one, since
+  // ctx.files speaks relative paths by design.
+  return `%APPDATA%\\Hermes\\plugin-files\\data\\${ID}`
+}
+
+/** Forget the cached probe. Only the test harness calls this, so a suite can
+ *  exercise "tools missing" and "tools present" in one process. */
+globalThis.__hermesResetTools = () => {
+  toolsProbe = null
+}
+
+/** Are the two tools this needs actually available? Probed once per session.
+ *
+ *  yt-dlp is not checked directly: `uvx yt-dlp` resolves and caches the
+ *  package on demand, so `uvx` being present IS yt-dlp being available — and
+ *  probing it by running it would cost a download inside a 30s shell door.
+ *  ffmpeg is checked because yt-dlp shells out to it for the mp3 transcode and
+ *  there is no equivalent on-demand story. */
+async function probeTools() {
+  if (toolsProbe) return toolsProbe
+  const script = windowsHost()
+    ? 'where ffmpeg>nul 2>&1 && echo ffmpeg=1 || echo ffmpeg=0 & where uvx>nul 2>&1 && echo uvx=1 || echo uvx=0'
+    : 'command -v ffmpeg >/dev/null 2>&1 && echo ffmpeg=1 || echo ffmpeg=0; command -v uvx >/dev/null 2>&1 && echo uvx=1 || echo uvx=0'
+  toolsProbe = (async () => {
+    const text = await runShell(script, { capture: true })
+    const found = String(text || '')
+    return { ytdlp: /uvx=1/.test(found), ffmpeg: /ffmpeg=1/.test(found) }
+  })()
+  return toolsProbe
+}
+
+/** Run one command through the gateway's shell door. Returns captured stdout
+ *  when `capture` is set, else a boolean "it launched". */
+async function runShell(command, { capture = false } = {}) {
+  const result = await host.request('shell.exec', { command })
+  const stdout = result?.stdout ?? ''
+  const code = result?.code ?? 0
+  return capture ? stdout : code === 0 || Boolean(stdout)
+}
+
+/** The job is a SCRIPT FILE, not a command line.
+ *
+ * `shell.exec` takes one string with `shell=True`, so an argument list has to
+ * survive two levels of quoting (the shell, then cmd's own `start`), and the
+ * first attempt at that produced `cmd /c "uvx yt-dlp "-x" …` where the inner
+ * quotes closed the outer — the job never started and the failure was silent
+ * because it happened before any output existed. Writing the steps to a script
+ * in the plugin's own folder means the only command the shell sees is
+ * `run this one file`, and every argument inside it is quoted once.
+ *
+ * Returns the script body. `status` is written last either way, so its
+ * presence always means "finished", and its content says which way.
+ */
+function jobScript({ exe, args, out, log, status, mp3 }) {
+  // `%` is a batch metacharacter. yt-dlp's output template is `%(ext)s`, so an
+  // unescaped path makes cmd fail to parse the WHOLE script — it reports
+  // "File Not Found" and never runs a line, which is indistinguishable from a
+  // bad URL from the plugin's side. Doubling is the batch escape.
+  const q = value => `"${String(value).replace(/"/g, '').replace(/%/g, '%%')}"`
+  const run = [exe, ...args.map(q)].join(' ')
+  const lines = [
+    '@echo off',
+    'setlocal',
+    // Nothing here prompts; a hidden child must never wait on a console.
+    `cd /d ${q(out)}`,
+    `rem ${run}`,
+    `${run} > ${q(log)} 2>&1`,
+    'set "RC=%ERRORLEVEL%"',
+    `if exist ${q(mp3)} (echo ok> ${q(status)}) else (echo fail> ${q(status)})`,
+    'endlocal',
+    'exit /b %RC%'
+  ]
+  return lines.join('\r\n') + '\r\n'
+}
+
+/** The one-line command that launches the job script and returns at once.
+ *
+ * The script takes NO arguments — every path is baked into it — which matters:
+ * `start /b cmd /c "script.cmd" "arg"` silently DROPS the arguments (probed
+ * here: four start-based forms all arrived with none, while a plain call
+ * received both), and a job that never starts looks exactly like a bad URL.
+ * `start /b` is kept only as the detach mechanism: the script itself exits
+ * immediately after spawning, so the shell door returns in well under 30s.
+ */
+function detachedCommand(scriptPath) {
+  if (windowsHost()) return `start "" /b ${`"${scriptPath}"`}`
+  return `nohup sh "${scriptPath}" >/dev/null 2>&1 &`
+}
+
+/** Length of the video in seconds, or null when YouTube will not say.
+ *  Runs in the foreground because it is fast (~2s) and because the answer
+ *  decides whether the job runs at all. */
+async function probeDuration(videoId) {
+  const out = await runShell(
+    `uvx yt-dlp --print duration --skip-download https://www.youtube.com/watch?v=${videoId}`,
+    { capture: true }
+  )
+  const match = String(out || '').match(/(\d+(?:\.\d+)?)\s*$/m)
+  const seconds = match ? Number(match[1]) : NaN
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null
+}
+
+/** Watch for the job's status file: 'ok' | 'fail' | 'timeout'. */
+async function waitForStatus(files, statusPath, budgetMs) {
+  const until = Date.now() + budgetMs
+  while (Date.now() < until) {
+    await sleep(YT_POLL_MS)
+    const read = await files.readText(files.dataFolder, statusPath)
+    if (read.ok) {
+      const text = (read.text || '').trim()
+      if (text) return text === 'ok' ? 'ok' : 'fail'
+    }
+  }
+  return 'timeout'
+}
+
+/** The tail of the job's log, so a failure explains itself. */
+async function readLogTail(files, logPath) {
+  const read = await files.readText(files.dataFolder, logPath)
+  if (!read.ok) return ''
+  const lines = String(read.text || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .filter(line => !/^\[download\]\s+\d/.test(line))
+  return lines.slice(-2).join(' ').slice(0, 240)
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 // ── data hygiene ──────────────────────────────────────────────────────────
 // Everything read back from storage is user-editable JSON, so each entry is
 // rebuilt from scratch; anything unrecognised is dropped rather than trusted.
@@ -652,6 +870,123 @@ function createEngine(ctx) {
     )
   }
 
+  /** Import one YouTube URL as an mp3 pad.
+   *
+   * Returns a promise that settles when the detached job writes its status
+   * file, so the caller can await it from a click handler. Everything the job
+   * writes lives in the plugin's OWN data folder, so `ctx.files` can read the
+   * result back without needing an absolute path anywhere else.
+   */
+  async function importYoutube(input, { onStage } = {}) {
+    const files = ctx.files
+    if (!files) throw new ImportError('noFileAccess', t('noFileAccess'))
+    const videoId = parseYoutube(input)
+    if (!videoId) throw new ImportError('badUrl', t('ytBadUrl'))
+    if (sounds.get().length >= MAX_SOUNDS) throw new ImportError('tooMany', t('tooMany'))
+
+    const dir = await dataDir()
+    if (!dir) throw new ImportError('noPath', t('ytNoPath'))
+
+    const tools = await probeTools(dir)
+    if (!tools.ytdlp) throw new ImportError('noYtdlp', t('ytNoYtdlp'))
+    if (!tools.ffmpeg) throw new ImportError('noFfmpeg', t('ytNoFfmpeg'))
+
+    const id = newId()
+    const stem = `yt-${id}`
+    const statusPath = `.${stem}.status`
+    const logPath = `.${stem}.log`
+    const mp3Path = `${stem}.mp3`
+
+    // Clean any stale files from a previous attempt with the same id.
+    await files.trash?.(files.dataFolder, statusPath)
+    await files.trash?.(files.dataFolder, logPath)
+
+    // Duration is probed FIRST, in the foreground, and the job then carries no
+    // comparison operator at all. That is not a style choice: `--match-filter
+    // "duration <= 30"` puts `<` and `>` in the command, cmd.exe eats them as
+    // redirects even inside quotes, and yt-dlp then reports "You must provide
+    // at least one URL" — a failure that looks like a bad URL, not a quoting
+    // bug. `--print duration` costs ~2s and fits inside the 30s shell door.
+    onStage?.('checking')
+    const seconds = await probeDuration(videoId)
+    if (seconds !== null && seconds > YT_MAX_SECONDS) {
+      throw new ImportError('tooLong', t('ytTooLong').replace('{secs}', String(Math.round(seconds))))
+    }
+
+    const args = [
+      '-x',
+      '--audio-format', 'mp3',
+      '--audio-quality', '5',
+      '--no-playlist',
+      '-o', `${joinNative(dir, stem)}.%(ext)s`,
+      `https://www.youtube.com/watch?v=${videoId}`
+    ]
+
+    const scriptPath = `.${stem}.cmd`
+    const script = jobScript({
+      exe: 'uvx yt-dlp',
+      args,
+      out: dir,
+      log: joinNative(dir, logPath),
+      status: joinNative(dir, statusPath),
+      mp3: joinNative(dir, mp3Path)
+    })
+    const wroteScript = await files.writeText(files.dataFolder, scriptPath, script)
+    if (!wroteScript.ok) throw new ImportError('failed', wroteScript.message || t('saveFailed'))
+
+    onStage?.('downloading')
+    const started = await runShell(detachedCommand(joinNative(dir, scriptPath)))
+    if (!started) throw new ImportError('noShell', t('ytNoShell'))
+
+    const outcome = await waitForStatus(files, statusPath, YT_TIMEOUT_MS)
+    if (outcome === 'timeout') throw new ImportError('timeout', t('ytTimeout'))
+    if (outcome !== 'ok') {
+      const detail = await readLogTail(files, logPath)
+      throw new ImportError('failed', detail || t('ytFailed'))
+    }
+
+    const audio = await files.readDataUrl(files.dataFolder, mp3Path)
+    if (!audio.ok) throw new ImportError('failed', audio.message || t('ytFailed'))
+    const size = Math.round((audio.url.length - audio.url.indexOf(',') - 1) * 0.75)
+    if (size > MAX_FILE_BYTES) {
+      await files.trash?.(files.dataFolder, mp3Path)
+      throw new ImportError('tooLarge', t('tooLarge'))
+    }
+
+    const sound = {
+      id,
+      name: uniqueName(`YouTube ${videoId.slice(0, 6)}`, sounds.get().map(item => item.name)),
+      kind: 'file',
+      mime: 'audio/mpeg',
+      bytes: size
+    }
+
+    // Re-encode the mp3 into the plugin's usual base64 blob so playback and
+    // deletion follow exactly the same path as an uploaded file.
+    const comma = audio.url.indexOf(',')
+    const written = await files.writeText(files.dataFolder, `${id}.b64`, audio.url.slice(comma + 1))
+    if (!written.ok) throw new ImportError('failed', written.message || t('saveFailed'))
+
+    for (const name of [mp3Path, statusPath, logPath, scriptPath]) {
+      await files.trash?.(files.dataFolder, name)
+    }
+
+    urls.set(id, audio.url)
+    persistSounds([...sounds.get(), sound])
+    onStage?.('done')
+    haptic('tap')
+    return sound
+  }
+
+  /** Host toast, hoisted so UI code never needs `ctx` itself. */
+  function notify(message) {
+    try {
+      ctx.notify?.(message)
+    } catch {
+      // A toast must never take down the caller.
+    }
+  }
+
   function stopAll() {
     for (const audio of playing) {
       audio.pause()
@@ -782,6 +1117,8 @@ function createEngine(ctx) {
     bind: toggleTrigger,
     toggleTrigger,
     clearTriggers,
+    importYoutube,
+    notify,
     restorePresets,
     setVolume: volume => persistSettings({ volume }),
     setShowLabel: showLabel => persistSettings({ showLabel }),
@@ -908,6 +1245,17 @@ const CSS = `
 .hermes-sb-foot-value{width:30px;flex-shrink:0;text-align:right;font-size:10px;line-height:12px;font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
 .hermes-sb-last{padding:4px 6px 0;font-size:9px;line-height:12px;color:var(--ui-text-quaternary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-drop{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;border-radius:8px;background:color-mix(in srgb,var(--ui-bg-elevated) 90%,transparent);box-shadow:inset 0 0 0 2px var(--ui-accent);font-size:11px;color:var(--ui-accent);z-index:5}
+.hermes-sb-yt{display:flex;align-items:center;gap:4px;margin-top:6px}
+.hermes-sb-yt-input{flex:1;min-width:0;height:22px;box-sizing:border-box;padding:0 6px;border-radius:4px;
+  font:inherit;font-size:11px;color:var(--ui-text-primary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary);outline:none}
+.hermes-sb-yt-input:focus{border-color:var(--ui-accent)}
+.hermes-sb-yt-input:disabled{opacity:.6}
+.hermes-sb-yt-go{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex-shrink:0;
+  border-radius:4px;color:var(--ui-bg-primary);background-color:var(--ui-accent)}
+.hermes-sb-yt-go:disabled{opacity:.45;cursor:default}
+.hermes-sb-yt-note{padding:4px 2px 0;font-size:9px;line-height:12px;color:var(--ui-text-quaternary)}
+.hermes-sb-yt-note[data-error=true]{color:var(--ui-text-secondary)}
 .hermes-sb-body{position:relative}
 `
 
@@ -1187,6 +1535,11 @@ function Panel({ engine }) {
   const last = useValue(engine.lastTrigger)
   const [manage, setManage] = useState(false)
   const [dragging, setDragging] = useState(false)
+  // YouTube import: the field is behind a button, the job is fire-and-watch.
+  const [ytOpen, setYtOpen] = useState(false)
+  const [ytUrl, setYtUrl] = useState('')
+  const [ytBusy, setYtBusy] = useState(false)
+  const [ytError, setYtError] = useState('')
   const panelRef = useRef(null)
   const fileRef = useRef(null)
 
@@ -1204,8 +1557,37 @@ function Panel({ engine }) {
     [engine]
   )
 
+  const importFromYoutube = useCallback(async () => {
+    const value = ytUrl.trim()
+    if (!value || ytBusy) return
+    setYtBusy(true)
+    setYtError('')
+    try {
+      const sound = await engine.importYoutube(value)
+      setYtUrl('')
+      setYtOpen(false)
+      // The toast goes through the engine: `ctx` is only in scope inside
+      // register(), and reaching for it from the panel threw a ReferenceError
+      // AFTER the pad had already been added — so the import worked but the
+      // user saw an error.
+      engine.notify({ kind: 'info', message: t('ytAdded').replace('{name}', sound.name) })
+    } catch (error) {
+      // The engine throws localised ImportErrors; anything else is shown raw.
+      setYtError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setYtBusy(false)
+    }
+  }, [engine, ytUrl, ytBusy, t])
+
   const onKeyDown = event => {
     if (event.key === 'Escape') {
+      // Escape closes the import row before it closes the whole panel —
+      // otherwise typing a URL and changing your mind shuts everything.
+      if (ytOpen) {
+        setYtOpen(false)
+        setYtError('')
+        return
+      }
       engine.open.set(false)
       return
     }
@@ -1270,6 +1652,21 @@ function Panel({ engine }) {
             })
           }),
           jsx(Tip, {
+            label: t('ytOpen'),
+            children: jsx('button', {
+              type: 'button',
+              className: 'hermes-sb-iconbtn',
+              'data-on': ytOpen,
+              'aria-expanded': ytOpen,
+              'aria-label': t('ytOpen'),
+              onClick: () => {
+                haptic('tap')
+                setYtOpen(value => !value)
+              },
+              children: jsx(icons.Link, { size: 11 })
+            })
+          }),
+          jsx(Tip, {
             label: manage ? t('done') : t('manage'),
             children: jsx('button', {
               type: 'button',
@@ -1299,6 +1696,46 @@ function Panel({ engine }) {
           void take(files)
         }
       }),
+
+      ytOpen
+        ? jsxs('div', {
+            className: 'hermes-sb-yt',
+            children: [
+              jsx('input', {
+                type: 'text',
+                className: 'hermes-sb-yt-input',
+                // Not type=url: yt-dlp accepts ids and short links, and a
+                // browser URL validator would refuse both.
+                placeholder: t('ytPlaceholder'),
+                value: ytUrl,
+                autoFocus: true,
+                spellCheck: false,
+                disabled: ytBusy,
+                'aria-label': t('ytPlaceholder'),
+                onChange: event => setYtUrl(event.target.value),
+                onKeyDown: event => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    void importFromYoutube()
+                  }
+                }
+              }),
+              jsx('button', {
+                type: 'button',
+                className: 'hermes-sb-yt-go',
+                'aria-label': t('ytImport'),
+                disabled: ytBusy || !ytUrl.trim(),
+                onClick: () => void importFromYoutube(),
+                children: ytBusy
+                  ? jsx(icons.Loader2, { size: 11 })
+                  : jsx(icons.Download, { size: 11 })
+              })
+            ]
+          })
+        : null,
+
+      ytBusy ? jsx('div', { className: 'hermes-sb-yt-note', children: t('ytWorking') }) : null,
+      ytError ? jsx('div', { className: 'hermes-sb-yt-note', 'data-error': 'true', children: ytError }) : null,
 
       manage
         ? jsxs('div', {
@@ -1516,6 +1953,19 @@ const LOCALES = {
     when: 'Play this sound when',
     whenNever: 'Never',
     whenCount: '{n} triggers',
+    ytOpen: 'Import from YouTube',
+    ytPlaceholder: 'YouTube link or video id',
+    ytImport: 'Convert to mp3',
+    ytWorking: 'Downloading and converting… this can take a minute.',
+    ytAdded: 'Added “{name}”.',
+    ytBadUrl: 'That is not a YouTube link.',
+    ytNoPath: 'This build does not expose a plugin folder, so a download has nowhere to land.',
+    ytNoYtdlp: 'yt-dlp is not available. Install uv (it is bundled with Hermes) and try again.',
+    ytNoFfmpeg: 'ffmpeg was not found on PATH — yt-dlp needs it to make an mp3.',
+    ytNoShell: 'Hermes refused to run the converter.',
+    ytTooLong: 'That video is {secs}s long. Soundboard clips are capped at 30s — pick a shorter one.',
+    ytTimeout: 'The conversion did not finish in three minutes.',
+    ytFailed: 'The conversion failed.',
     whenClear: 'Clear all triggers',
     lastTrigger: trigger => `Last trigger: ${trigger}`,
     showLabel: 'Show the Soundboard label in the status bar',
@@ -1547,6 +1997,19 @@ const LOCALES = {
     when: 'Odtwórz ten dźwięk gdy',
     whenNever: 'Nigdy',
     whenCount: '{n} wyzwalaczy',
+    ytOpen: 'Importuj z YouTube',
+    ytPlaceholder: 'Link do YouTube lub id filmu',
+    ytImport: 'Konwertuj do mp3',
+    ytWorking: 'Pobieranie i konwersja… to może chwilę potrwać.',
+    ytAdded: 'Dodano „{name}”.',
+    ytBadUrl: 'To nie jest link do YouTube.',
+    ytNoPath: 'Ta wersja nie udostępnia folderu wtyczki, więc pobranie nie ma gdzie trafić.',
+    ytNoYtdlp: 'yt-dlp jest niedostępny. Zainstaluj uv (jest w zestawie z Hermes) i spróbuj ponownie.',
+    ytNoFfmpeg: 'Nie znaleziono ffmpeg w PATH — yt-dlp potrzebuje go do mp3.',
+    ytNoShell: 'Hermes odmówił uruchomienia konwertera.',
+    ytTooLong: 'Ten film ma {secs}s. Klipy dźwiękowe są ograniczone do 30s — wybierz krótszy.',
+    ytTimeout: 'Konwersja nie zakończyła się w trzy minuty.',
+    ytFailed: 'Konwersja nie powiodła się.',
     whenClear: 'Wyczyść wszystkie wyzwalacze',
     lastTrigger: trigger => `Ostatni wyzwalacz: ${trigger}`,
     showLabel: 'Pokazuj podpis Soundboard na pasku stanu',
