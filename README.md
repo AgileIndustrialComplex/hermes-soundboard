@@ -55,6 +55,11 @@ mode all persist per machine.
   suspends the audio context. Each pad also has its own **gain trim** (0-200%,
   stepped with −/+) for the one clip that is still too loud or quiet — the
   master slider stays a single global control.
+- **Trim an existing clip.** Any imported or uploaded pad gets a trim button in
+  manage mode: two fields (from / length, in seconds) and an optional *keep
+  original*. Trimming is destructive — the stored bytes are replaced — so the
+  checkbox on by default cuts a copy instead, leaving the pad you already have
+  untouched. Synthesised cues have no trim button: there are no bytes to cut.
 - **Drag to reorder.** Pads drag by their body; a line marks where the drop
   lands. Order matters because `1`-`9` fire by position, so dragging is also how
   you choose which key hits which pad.
@@ -104,6 +109,7 @@ status file. Three details are load-bearing and each was a real failure first:
 | Every path is **relative**, anchored by `%~dp0` | Batch needs `%%` for a literal `%`, so an env-var path like `%APPDATA%` written through the same escaper became the literal text `%%APPDATA%%` — the script could not `cd`, exited 0, and wrote **no status file**, so the plugin waited out its whole budget on a job that had already died |
 | The script takes **no arguments** | `start /b cmd /c "script.cmd" "arg"` silently drops arguments — four forms were probed, all arrived empty. Every path is baked into the script instead |
 | The trim/normalise step is **parenthesised** | `a && b >> log` redirects only `b`, and a trailing `>nul` collides with it — the whole post-process silently vanished. `( a && b ) >> log` covers the chain |
+| A stored clip is trimmed through **PowerShell** | The stored form is base64 text, and the plugin has no Node runtime: PowerShell decodes it to a temp mp3, ffmpeg cuts, PowerShell re-encodes back over the `.b64`. Verified end to end: 2.28s → 1.200s in place |
 | `%` is **doubled** | `-o out.%(ext)s` — an unescaped `%` makes cmd refuse to parse the whole file (`File Not Found`), running no line at all |
 | Duration is probed **in the foreground** | `--match-filter "duration <= 30"` puts `<`/`>` in the command, which cmd eats as redirection even inside quotes; yt-dlp then reports "You must provide at least one URL" |
 

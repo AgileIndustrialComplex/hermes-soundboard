@@ -19,14 +19,17 @@ function grab(name, endMarker) {
 
 const chunk = [
   grab('function parseYoutube', '\nclass ImportError'),
-  grab('function jobScript', '\nasync function waitForStatus'),
+  grab('function jobScript', '\n/** Script that re-cuts an ALREADY STORED clip'),
+  grab('function trimScript', '/** The one-line command'),
+  grab('function detachedCommand', '\n/** Length of the video in seconds'),
+
   // The extracted slice references the platform helper; the unit test is about
   // the Windows shape, so it says so.
   'const IS_WINDOWS = true\nconst windowsHost = () => true\n'
 ].join('\n')
 
 const mod = await import(
-  'data:text/javascript;base64,' + Buffer.from(chunk + '\nexport { parseYoutube, jobScript, detachedCommand }').toString('base64')
+  'data:text/javascript;base64,' + Buffer.from(chunk + '\nexport { parseYoutube, jobScript, trimScript, detachedCommand }').toString('base64')
 )
 
 let pass = 0
@@ -45,7 +48,7 @@ const eq = (a, b, label = '') => {
   if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${label} got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`)
 }
 
-const { parseYoutube, jobScript, detachedCommand } = mod
+const { parseYoutube, jobScript, trimScript, detachedCommand } = mod
 
 check('a bare 11-char id is accepted', () => eq(parseYoutube('jNQXAC9IVRw'), 'jNQXAC9IVRw'))
 check('a watch URL is parsed', () => eq(parseYoutube('https://www.youtube.com/watch?v=jNQXAC9IVRw'), 'jNQXAC9IVRw'))
@@ -165,6 +168,37 @@ check('the status check looks for the FINAL mp3', () => {
 check('a script without a post step omits it entirely', () => {
   const plain = jobScript({ exe: 'uvx yt-dlp', args: ['x'], out: '%~dp0', log: '.b.log', status: '.b.status', mp3: 'b.mp3' })
   if (/ffmpeg/.test(plain)) throw new Error('ffmpeg leaked into a plain job')
+})
+
+// ── trimming an EXISTING clip ────────────────────────────────────────────
+const trimOut = trimScript({ id: 'snd-abc', start: 0.5, length: 1.2, tmp: '.in.mp3', out: '.out.mp3' })
+
+check('the trim script decodes the stored base64 first', () => {
+  if (!/FromBase64String/.test(trimOut)) throw new Error('no decode step')
+  if (!/ReadAllText\('%~dp0snd-abc\.b64'\)/.test(trimOut)) throw new Error(trimOut.split('\r\n')[3])
+})
+check('it cuts with ffmpeg using the requested window', () => {
+  if (!/-ss 0\.5 -t 1\.2/.test(trimOut)) throw new Error('window missing')
+  if (!/-b:a 128k/.test(trimOut)) throw new Error('no output encoding')
+})
+check('it re-encodes the result back into the .b64', () => {
+  if (!/ToBase64String/.test(trimOut)) throw new Error('no encode step')
+  if (!/WriteAllText\('%~dp0snd-abc\.b64'/.test(trimOut)) throw new Error('does not replace the original')
+})
+check('a failed cut reports fail instead of claiming ok', () => {
+  if (!/if not exist "\.out\.mp3" \(echo fail>/.test(trimOut)) throw new Error('no failure branch')
+  const lines = trimOut.split('\r\n')
+  const failAt = lines.findIndex(l => l.includes('echo fail>'))
+  const okAt = lines.findIndex(l => l.startsWith('echo ok>'))
+  if (okAt < failAt) throw new Error('the ok line can run after a failure')
+})
+check('a from-0 window omits the -ss flag', () => {
+  const zero = trimScript({ id: 'x', start: 0, length: 1, tmp: '.i', out: '.o' })
+  if (/-ss/.test(zero)) throw new Error('emitted a pointless -ss 0')
+})
+check('the trim script anchors to %~dp0 and escapes no env var', () => {
+  if (!trimOut.includes('cd /d "%~dp0"')) throw new Error('no anchor')
+  if (/%APPDATA%/i.test(trimOut)) throw new Error('env var leaked')
 })
 
 // ── the launch command ──────────────────────────────────────────────────

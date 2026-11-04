@@ -768,6 +768,54 @@ check('gain is clamped to 0-200', () => {
   engine.setGain(id, 100)
 })
 
+// ── trimming an existing clip ───────────────────────────────────────────
+check('trimming is refused when no window is given', async () => {
+  const engine = boot.ctx.__engine
+  const file = engine.sounds.get().find(s => s.kind === 'file')
+  if (!file) throw new Error('no file pad')
+  let failed = null
+  try {
+    await engine.trimSound(file.id, { start: 0, length: null })
+  } catch (error) {
+    failed = error
+  }
+  if (!failed) throw new Error('an empty window was accepted')
+  if (!/start or a length|początek lub długość/i.test(failed.message)) {
+    throw new Error(`message: ${failed.message}`)
+  }
+})
+
+check('a synthesised cue cannot be trimmed', async () => {
+  const engine = boot.ctx.__engine
+  const synth = engine.sounds.get().find(s => s.kind === 'synth')
+  let failed = null
+  try {
+    await engine.trimSound(synth.id, { start: 0, length: 1 })
+  } catch (error) {
+    failed = error
+  }
+  if (!failed) throw new Error('a synth pad was accepted')
+  if (!/only imported|cannot be trimmed|tylko klipy/i.test(failed.message)) {
+    throw new Error(`message: ${failed.message}`)
+  }
+})
+
+check('duplicating a clip copies its bytes to a new pad', async () => {
+  const engine = boot.ctx.__engine
+  const file = engine.sounds.get().find(s => s.kind === 'file')
+  const before = engine.sounds.get().length
+  const copy = await engine.duplicate(file.id)
+  if (!copy) throw new Error('no copy returned')
+  const after = engine.sounds.get()
+  if (after.length !== before + 1) throw new Error('pad count unchanged')
+  const made = after.find(s => s.id === copy.id)
+  if (!made || made.kind !== 'file') throw new Error('copy is not a file pad')
+  if (!/copy/i.test(made.name)) throw new Error(`name: ${made.name}`)
+  if (!files.has(`${copy.id}.b64`)) throw new Error('clip bytes were not copied')
+  // The original must be untouched.
+  if (!files.has(`${file.id}.b64`)) throw new Error('the original clip was lost')
+})
+
 check('stop-all clears the active flashes', () => {
   if (pads().some(pad => pad.getAttribute('data-active') === 'true')) throw new Error('a pad is still flashing')
 })

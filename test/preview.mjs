@@ -772,6 +772,86 @@ await shot('preview-manage.png')
 await page.click('.hermes-sb-panel button[aria-label="Done"]')
 await page.waitForTimeout(200)
 
+// The trim control must exist per file pad, open into a full-width panel, and
+// keep every control on the row's 21px grid.
+// Ensure manage mode is open (the block above closes it).
+if (!(await page.$('.hermes-sb-row'))) {
+  await page.click('.hermes-sb-panel button[aria-label="Manage sounds"]')
+  await page.waitForTimeout(250)
+}
+const widths = await page.evaluate(() => {
+  const row = document.querySelector('.hermes-sb-row')
+  if (!row) return null
+  const w = sel => {
+    const n = row.querySelector(sel)
+    return n ? Math.round(n.getBoundingClientRect().width) : null
+  }
+  return {
+    row: Math.round(row.getBoundingClientRect().width),
+    play: w('.hermes-sb-rowbtn'),
+    picker: w('.hermes-sb-picker'),
+    name: w('.hermes-sb-row-name'),
+    gain: w('.hermes-sb-gain'),
+    total: [...row.children].reduce((sum, n) => sum + n.getBoundingClientRect().width, 0)
+  }
+})
+console.log(`row widths: ${JSON.stringify(widths)}`)
+// A name field narrower than its own text is the bug this measurement exists to
+// catch: at 31px every label clipped mid-word.
+if (widths && widths.name < 60) console.log(`!! the name field is only ${widths.name}px — names will clip`)
+const nameFit = await page.evaluate(() => {
+  const inputs = [...document.querySelectorAll('.hermes-sb-row-name')]
+  return {
+    total: inputs.length,
+    // An input shows no ellipsis glyph, so "too long" is judged by overflow,
+    // and the important thing is that the FIELD is wide enough to be usable.
+    overflowing: inputs.filter(n => n.scrollWidth > n.clientWidth + 1).map(n => n.value)
+  }
+})
+console.log(`  ${nameFit.total - nameFit.overflowing.length}/${nameFit.total} names fit their field`)
+if (nameFit.overflowing.length) {
+  console.log(`    longer than the field: ${JSON.stringify(nameFit.overflowing)}`)
+}
+const trimUi = await page.evaluate(() => {
+  const rows = [...document.querySelectorAll('.hermes-sb-row')]
+  const trims = [...document.querySelectorAll('.hermes-sb-rowbtn[data-trim]')]
+  // Only clips can be trimmed; synthesised cues must not offer it.
+  const synthRows = rows.filter(r => !r.querySelector('.hermes-sb-rowbtn[data-trim]'))
+  return { rows: rows.length, trimButtons: trims.length, rowsWithoutTrim: synthRows.length }
+})
+console.log(`trim buttons: ${JSON.stringify(trimUi)}`)
+if (!trimUi.trimButtons) console.log('!! no trim control rendered')
+else console.log(`  ${trimUi.trimButtons} of ${trimUi.rows} rows offer trimming (the rest are synthesised cues)`)
+
+// Open the first one and measure the panel.
+await page.click('.hermes-sb-rowbtn[data-trim]')
+await page.waitForTimeout(250)
+const panel = await page.evaluate(() => {
+  const box = document.querySelector('.hermes-sb-trim')
+  if (!box) return null
+  const r = box.getBoundingClientRect()
+  const row = box.closest('.hermes-sb-row').getBoundingClientRect()
+  return {
+    width: Math.round(r.width),
+    rowWidth: Math.round(row.width),
+    fields: [...box.querySelectorAll('.hermes-sb-trim-input')].length,
+    hasCopy: Boolean(box.querySelector('.hermes-sb-trim-copy input')),
+    goDisabled: box.querySelector('.hermes-sb-trim-go')?.disabled,
+    clipped: r.right > row.right + 1 || r.left < row.left - 1
+  }
+})
+console.log(`trim panel: ${JSON.stringify(panel)}`)
+if (!panel) console.log('!! the trim panel did not open')
+else {
+  if (panel.fields !== 2) console.log(`!! expected 2 trim fields, got ${panel.fields}`)
+  if (!panel.hasCopy) console.log('!! no keep-original option')
+  if (!panel.goDisabled) console.log('!! Trim is enabled with an empty window')
+  if (panel.clipped) console.log('!! the trim panel overflows its row')
+}
+await shot('preview-trim.png')
+await page.click('.hermes-sb-rowbtn[data-trim]')
+await page.waitForTimeout(150)
+
 // Settings page.
 await page.evaluate(() => window.__mountSettings())
 await page.waitForTimeout(300)

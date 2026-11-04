@@ -560,6 +560,37 @@ function jobScript({ exe, args, out, log, status, mp3, post }) {
   return lines.join('\r\n') + '\r\n'
 }
 
+/** Script that re-cuts an ALREADY STORED clip.
+ *
+ * The stored form is base64 text (`<id>.b64`), so the round trip is:
+ * PowerShell decodes it to a temp mp3, ffmpeg cuts the window, PowerShell
+ * re-encodes the result, and the new text replaces the old file. PowerShell is
+ * used rather than a Node helper because the plugin has no Node runtime and its
+ * only file door is text-oriented.
+ *
+ * Every path is relative to `%~dp0` for the same reason as the download script:
+ * a batch `%` escape would otherwise mangle any env-var path into literal text.
+ */
+function trimScript({ id, start, length, tmp, out }) {
+  const lines = [
+    '@echo off',
+    'setlocal',
+    'cd /d "%~dp0"',
+    `rem decode ${id}.b64`,
+    `powershell -NoProfile -Command "$b=[IO.File]::ReadAllText('%~dp0${id}.b64').Trim(); [IO.File]::WriteAllBytes('%~dp0${tmp}',[Convert]::FromBase64String($b))"`,
+    `rem trim`,
+    `ffmpeg -hide_banner -loglevel error -y ${start > 0 ? `-ss ${start} ` : ''}${length ? `-t ${length} ` : ''}-i "${tmp}" -b:a 128k "${out}"`,
+    `if not exist "${out}" (echo fail> ".${id}.trimstatus" & endlocal & exit /b 1)`,
+    `rem re-encode`,
+    `powershell -NoProfile -Command "$b=[Convert]::ToBase64String([IO.File]::ReadAllBytes('%~dp0${out}')); [IO.File]::WriteAllText('%~dp0${id}.b64',$b)"`,
+    `echo ok> ".${id}.trimstatus"`,
+    'endlocal',
+    'exit /b 0'
+  ]
+
+  return lines.join('\r\n') + '\r\n'
+}
+
 /** The one-line command that launches the job script and returns at once.
  *
  * The script takes NO arguments — every path is baked into it — which matters:
@@ -1141,6 +1172,104 @@ function createEngine(ctx) {
     return sound
   }
 
+  /** Copy a clip to a new pad, so a destructive trim can leave the original be. */
+  async function duplicate(soundId) {
+    const files = ctx.files
+    const sound = sounds.get().find(item => item.id === soundId)
+    if (!sound || !files) return null
+    if (sounds.get().length >= MAX_SOUNDS) {
+      notify({ kind: 'warning', message: t('tooMany') })
+      return null
+    }
+    const id = newId()
+    if (sound.kind === 'file') {
+      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
+      if (!read.ok) {
+        notify({ kind: 'error', message: read.message || t('missingAudio') })
+        return null
+      }
+      const written = await files.writeText(files.dataFolder, `${id}.b64`, read.text)
+      if (!written.ok) {
+        notify({ kind: 'error', message: written.message || t('saveFailed') })
+        return null
+      }
+    }
+    const copy = {
+      ...sound,
+      id,
+      name: uniqueName(`${sound.name} copy`, sounds.get().map(item => item.name))
+    }
+    persistSounds([...sounds.get(), copy])
+    haptic('tap')
+
+    return copy
+  }
+
+  /** Re-cut one stored clip in place.
+   *
+   * Trimming is destructive — the original bytes are gone — because keeping a
+   * pristine copy would double the storage for a feature whose whole point is
+   * "this pad is too long". The pad's name, triggers and gain are untouched.
+   */
+  async function trimSound(soundId, { start = 0, length = null } = {}) {
+    const files = ctx.files
+    if (!files) throw new ImportError('noFileAccess', t('noFileAccess'))
+    const sound = sounds.get().find(item => item.id === soundId)
+    // Validate what the USER controls first: a bad window or an unsuitable pad is
+    // their mistake, and reporting "open a chat" instead would be misleading.
+    if (!sound || sound.kind !== 'file') throw new ImportError('notFile', t('trimOnlyFiles'))
+
+    const from = Math.max(0, Number(start) || 0)
+    const span = length === null || length === '' ? null : Math.max(0.2, Number(length) || 0)
+    if (!from && !span) throw new ImportError('noWindow', t('trimNeedsWindow'))
+
+    if (!activeSessionId()) throw new ImportError('noSession', t('ytNoSession'))
+
+    const tools = await probeTools()
+    if (!tools.ffmpeg) throw new ImportError('noFfmpeg', t('ytNoFfmpeg'))
+
+    const id = sound.id
+    const scriptPath = `.${id}.trim.cmd`
+    const statusPath = `.${id}.trimstatus`
+    const tmp = `.${id}.trim-in.mp3`
+    const out = `.${id}.trim-out.mp3`
+
+    for (const name of [statusPath, scriptPath, tmp, out]) {
+      await files.trash?.(files.dataFolder, name)
+    }
+
+    const wrote = await files.writeText(
+      files.dataFolder,
+      scriptPath,
+      trimScript({ id, start: from, length: span, tmp, out })
+    )
+    if (!wrote.ok) throw new ImportError('failed', wrote.message || t('saveFailed'))
+
+    const started = await runShell(detachedCommand(joinNative(await dataDir() ?? '.', scriptPath)))
+    if (!started) throw new ImportError('noShell', t('ytNoShell'))
+
+    const outcome = await waitForStatus(files, statusPath, YT_TIMEOUT_MS)
+    for (const name of [scriptPath, tmp, out]) await files.trash?.(files.dataFolder, name)
+    if (outcome !== 'ok') {
+      await files.trash?.(files.dataFolder, statusPath)
+      throw new ImportError('failed', t('trimFailed'))
+    }
+    await files.trash?.(files.dataFolder, statusPath)
+
+    // The cached data URL is now stale; the next play re-reads the file.
+    urls.delete(id)
+    const read = await files.readText(files.dataFolder, `${id}.b64`)
+    if (read.ok) {
+      persistSounds(
+        sounds.get().map(item =>
+          item.id === id ? { ...item, bytes: Math.round(String(read.text).length * 0.75) } : item
+        )
+      )
+    }
+    haptic('tap')
+    return true
+  }
+
   /** Host toast, hoisted so UI code never needs `ctx` itself. */
   function notify(message) {
     try {
@@ -1307,6 +1436,8 @@ function createEngine(ctx) {
     bind: toggleTrigger,
     toggleTrigger,
     clearTriggers,
+    trimSound,
+    duplicate,
     move,
     setGain,
     importYoutube,
@@ -1369,7 +1500,7 @@ const CSS = `
 .hermes-sb-empty{padding:18px 8px;text-align:center;font-size:11px;line-height:16px;color:var(--ui-text-tertiary)}
 .hermes-sb-list{display:flex;flex-direction:column;gap:2px;max-height:min(42vh,268px);overflow-y:auto;overscroll-behavior:contain;padding:2px;scrollbar-gutter:stable}
 .hermes-sb-row{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
-.hermes-sb-row .hermes-sb-row-name{flex:1;min-width:0;font-size:11px}
+.hermes-sb-row .hermes-sb-row-name{flex:1;min-width:0;font-size:11px;text-overflow:ellipsis}
 /* The trigger picker is a button + an in-DOM menu, NOT a native <select>.
    A native option list is a browser-drawn popup coloured from the page's
    color-scheme property; inside this popover it came up as a near-white sheet
@@ -1381,6 +1512,12 @@ const CSS = `
    124x22 box and the menu, however wide it is told to be, can only render
    inside that box — which is why it came out 124px wide and unreadable. */
 .hermes-sb-when{display:contents}
+/* Width budget for a manage row inside a 308px panel (271 usable after the
+   list's padding): play 22 + picker + name + gain 56 + trim 22 + delete 22, plus
+   4px gaps between six children. The picker used to claim 124px, which left the
+   name field 31px — a name nobody can read. It now claims 92px and the name
+   takes the remainder, which is the field a person actually types in. */
+.hermes-sb-row .hermes-sb-picker{flex:0 0 92px;width:92px}
 .hermes-sb-picker{flex:0 0 124px;width:124px;height:21px;box-sizing:border-box;margin:0;display:flex;align-items:center;gap:2px;
   padding:0 4px;border-radius:3px;text-align:left;
   font-size:10px;line-height:13px;color:var(--ui-text-secondary);
@@ -1422,11 +1559,33 @@ const CSS = `
   border-top:1px solid var(--ui-stroke-secondary)}
 .hermes-sb-menu-clear:hover{color:var(--ui-text-primary);background-color:var(--chrome-action-hover)}
 /* Per-pad trim: three tiny cells, aligned to the row's 21px control height. */
+/* The trim row takes a full line inside the manage row (flex-wrap is on). */
+.hermes-sb-trim{flex:0 0 100%;display:flex;align-items:center;gap:5px;flex-wrap:wrap;
+  margin:3px 0 2px;padding:5px 4px;border-radius:4px;
+  background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-trim-field{display:flex;align-items:center;gap:3px;flex:0 0 auto}
+.hermes-sb-trim-label{font-size:9px;line-height:11px;color:var(--ui-text-tertiary);white-space:nowrap}
+.hermes-sb-trim-input{width:44px;height:19px;box-sizing:border-box;padding:0 4px;border-radius:3px;
+  font:inherit;font-size:10px;color:var(--ui-text-primary);background-color:var(--ui-bg-secondary);
+  border:1px solid var(--ui-stroke-secondary);outline:none}
+.hermes-sb-trim-input:focus{border-color:var(--ui-accent)}
+.hermes-sb-trim-input::-webkit-inner-spin-button,
+.hermes-sb-trim-input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.hermes-sb-trim-copy{display:flex;align-items:center;gap:3px;font-size:9px;line-height:11px;
+  color:var(--ui-text-tertiary);white-space:nowrap;cursor:pointer}
+.hermes-sb-trim-copy input{margin:0;accent-color:var(--ui-accent)}
+.hermes-sb-trim-go{margin-left:auto;height:19px;padding:0 7px;border-radius:3px;font-size:9px;line-height:11px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-secondary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-trim-go:hover:not(:disabled){border-color:var(--ui-accent);color:var(--ui-text-primary)}
+.hermes-sb-trim-go:disabled{opacity:.45;cursor:default}
+.hermes-sb-trim-error{flex:0 0 100%;padding:2px 4px 0;font-size:9px;line-height:12px;
+  color:var(--ui-text-secondary)}
 .hermes-sb-gain{display:flex;align-items:center;gap:1px;flex:0 0 auto;height:21px}
-.hermes-sb-gain-step{width:14px;height:21px;border-radius:3px;font-size:11px;line-height:1;
+.hermes-sb-gain-step{width:12px;height:21px;border-radius:3px;font-size:11px;line-height:1;
   color:var(--ui-text-tertiary);background:transparent}
 .hermes-sb-gain-step:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
-.hermes-sb-gain-value{min-width:26px;text-align:center;font-size:9px;line-height:11px;
+.hermes-sb-gain-value{min-width:22px;text-align:center;font-size:9px;line-height:11px;
   font-variant-numeric:tabular-nums;color:var(--ui-text-quaternary)}
 .hermes-sb-gain-value[data-off=true]{color:var(--ui-accent)}
 /* Dragging: the source dims, and a pad the drag would land before gets a line
@@ -1735,6 +1894,36 @@ function TriggerSelect({ sound, engine }) {
 function ManageRow({ sound, engine }) {
   const t = usePluginI18n(ID)
   const [draft, setDraft] = useState(sound.name)
+  // Trimming is destructive, so it opens on demand rather than sitting in every
+  // row's tab order — and is only offered for clips, never for a synthesised cue.
+  const [trimOpen, setTrimOpen] = useState(false)
+  const [trimStart, setTrimStart] = useState('')
+  const [trimLength, setTrimLength] = useState('')
+  const [trimBusy, setTrimBusy] = useState(false)
+  const [trimError, setTrimError] = useState('')
+  const [trimCopy, setTrimCopy] = useState(true)
+
+  const doTrim = async () => {
+    if (trimBusy) return
+    setTrimBusy(true)
+    setTrimError('')
+    try {
+      const target = trimCopy ? await engine.duplicate(sound.id) : null
+      const id = target?.id ?? sound.id
+      await engine.trimSound(id, {
+        start: trimStart.trim() ? Number(trimStart) : 0,
+        length: trimLength.trim() ? Number(trimLength) : null
+      })
+      setTrimOpen(false)
+      setTrimStart('')
+      setTrimLength('')
+      engine.notify({ kind: 'info', message: t('trimDone') })
+    } catch (error) {
+      setTrimError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setTrimBusy(false)
+    }
+  }
 
   useEffect(() => {
     setDraft(sound.name)
@@ -1807,6 +1996,24 @@ function ManageRow({ sound, engine }) {
           })
         ]
       }),
+      sound.kind === 'file'
+        ? jsx(Tip, {
+            label: t('trim'),
+            children: jsx('button', {
+              type: 'button',
+              className: 'hermes-sb-rowbtn',
+              'data-trim': 'true',
+              'data-on': trimOpen,
+              'aria-expanded': trimOpen,
+              'aria-label': `${t('trim')}: ${sound.name}`,
+              onClick: () => {
+                setTrimOpen(value => !value)
+                setTrimError('')
+              },
+              children: jsx(icons.Clock, { size: 11 })
+            })
+          })
+        : null,
       jsx(Tip, {
         label: `${t('delete')}: ${sound.name}`,
         children: jsx('button', {
@@ -1817,7 +2024,57 @@ function ManageRow({ sound, engine }) {
           onClick: () => engine.remove(sound.id),
           children: jsx(icons.Trash2, { size: 11 })
         })
-      })
+      }),
+      trimOpen
+        ? jsxs('div', {
+            className: 'hermes-sb-trim',
+            children: [
+              jsx('label', {
+                className: 'hermes-sb-trim-field',
+                children: [
+                  jsx('span', { className: 'hermes-sb-trim-label', children: t('ytStart') }),
+                  jsx('input', {
+                    type: 'number', min: '0', step: '0.1', placeholder: '0',
+                    className: 'hermes-sb-trim-input', value: trimStart,
+                    disabled: trimBusy, 'aria-label': t('ytStart'),
+                    onChange: event => setTrimStart(event.target.value)
+                  })
+                ]
+              }),
+              jsx('label', {
+                className: 'hermes-sb-trim-field',
+                children: [
+                  jsx('span', { className: 'hermes-sb-trim-label', children: t('ytLength') }),
+                  jsx('input', {
+                    type: 'number', min: '0.2', step: '0.1', placeholder: 'all',
+                    className: 'hermes-sb-trim-input', value: trimLength,
+                    disabled: trimBusy, 'aria-label': t('ytLength'),
+                    onChange: event => setTrimLength(event.target.value)
+                  })
+                ]
+              }),
+              jsx('label', {
+                className: 'hermes-sb-trim-copy',
+                title: t('trimCopyHint'),
+                children: [
+                  jsx('input', {
+                    type: 'checkbox', checked: trimCopy, disabled: trimBusy,
+                    onChange: event => setTrimCopy(event.target.checked)
+                  }),
+                  jsx('span', { children: t('trimCopy') })
+                ]
+              }),
+              jsx('button', {
+                type: 'button',
+                className: 'hermes-sb-trim-go',
+                disabled: trimBusy || (!trimStart.trim() && !trimLength.trim()),
+                onClick: () => void doTrim(),
+                children: trimBusy ? t('ytWorking') : t('trimApply')
+              })
+            ]
+          })
+        : null,
+      trimError ? jsx('div', { className: 'hermes-sb-trim-error', children: trimError }) : null
     ]
   }, sound.id)
 }
@@ -2366,6 +2623,14 @@ const LOCALES = {
     gainUp: 'Raise volume for',
     gainDown: 'Lower volume for',
     gainHint: 'This pad\'s own volume, relative to the master slider',
+    trim: 'Trim clip',
+    trimApply: 'Trim',
+    trimCopy: 'keep original',
+    trimCopyHint: 'Trim a copy, so the current pad stays as it is',
+    trimDone: 'Clip trimmed.',
+    trimFailed: 'The trim did not complete.',
+    trimNeedsWindow: 'Give a start or a length — otherwise nothing would change.',
+    trimOnlyFiles: 'Only imported or uploaded clips can be trimmed.',
     ytWorking: 'Converting…',
     ytAdded: 'Added “{name}”.',
     ytBadUrl: 'That is not a YouTube link.',
@@ -2421,6 +2686,14 @@ const LOCALES = {
     gainUp: 'Podgłoś',
     gainDown: 'Ścisz',
     gainHint: 'Głośność tej podkładki względem głównego suwaka',
+    trim: 'Przytnij klip',
+    trimApply: 'Przytnij',
+    trimCopy: 'zachowaj oryginał',
+    trimCopyHint: 'Przytnij kopię, aby obecna podkładka została bez zmian',
+    trimDone: 'Klip przycięty.',
+    trimFailed: 'Przycinanie nie powiodło się.',
+    trimNeedsWindow: 'Podaj początek lub długość — inaczej nic się nie zmieni.',
+    trimOnlyFiles: 'Przycinać można tylko klipy zaimportowane lub wgrane.',
     ytWorking: 'Pobieranie i konwersja… to może chwilę potrwać.',
     ytAdded: 'Dodano „{name}”.',
     ytBadUrl: 'To nie jest link do YouTube.',
