@@ -169,4 +169,28 @@ const icon = name => {
   return Component
 }
 
-export const icons = new Proxy({}, { get: (_target, key) => (typeof key === 'string' ? icon(key) : undefined) })
+// The icon table is the REAL list the desktop SDK exports (`export * as icons
+// from '@/lib/icons'`). It must not be a permissive Proxy: a Proxy fabricates a
+// component for any name, so `icons.Trash` (which does not exist — the SDK
+// exports Trash2) renders fine here and blows up in the app with React #130
+// "element type is invalid". Unknown names throw instead, at import time.
+const ICON_NAMES = 'Activity,AlertCircle,AlertTriangle,AppWindow,Archive,ArchiveOff,ArrowBarToDown,ArrowBarToUp,ArrowUp,ArrowUpRight,AtSign,AudioLines,BarChart3,Bell,Book,Bookmark,BookmarkFilled,Box,Brain,Bug,Check,CheckCircle2,CheckIcon,ChevronDown,ChevronDownIcon,ChevronLeft,ChevronLeftIcon,ChevronRight,ChevronRightIcon,ChevronUp,CircleIcon,CircleLetterA,Clipboard,Clock,Cloud,Command,Copy,CopyIcon,CornerDownLeft,Cpu,CreditCard,Download,Ear,EarOff,Egg,Eject,ExternalLink,Eye,EyeOff,FileImage,FileText,FolderOpen,GitBranch,GitBranchIcon,GitFork,GitForkIcon,Globe,Hash,HelpCircle,ImageIcon,Info,Keyboard,KeyRound,Layers3,LayoutDashboard,Link,Link2,LinkIcon,Loader2,Loader2Icon,Lock,LockOpen,LogIn,Mail,Maximize,MessageCircle,MessageCode,MessageQuestion,MessageSquareText,Mic,MicOff,Monitor,MonitorPlay,Moon,MoreHorizontal,MoreHorizontalIcon,MoreVertical,Network,NotebookTabs,Package,Palette,PanelBottom,PanelLeftIcon,PanelTop,Pause,PawPrint,Pencil,PencilIcon,PencilLine,Pin,Play,Plug,Plus,Power,QrCode,RefreshCw,RefreshCwIcon,Save,Search,SearchIcon,Send,Settings,Settings2,ShieldLock,SlidersHorizontal,SmilePlusIcon,Square,Starmap,SteeringWheel,StopFilled,Sun,Terminal,Trash2,Upload,Users,Volume2,Volume2Icon,VolumeX,VolumeXIcon,Wrench,X,XIcon,Zap,ZapFilled,ZoomIn,ZoomOut'.split(',')
+
+const iconTable = {}
+for (const name of ICON_NAMES) iconTable[name] = icon(name)
+
+export const icons = new Proxy(iconTable, {
+  get(target, key) {
+    if (typeof key !== 'string') return undefined
+    if (!(key in target)) {
+      // Suggest near-misses rather than dumping all 130 names.
+      const close = ICON_NAMES.filter(name => name.startsWith(key) || key.startsWith(name))
+      throw new Error(
+        `icons.${key} does not exist in @hermes/plugin-sdk.` +
+        (close.length ? ` Did you mean: ${close.join(', ')}?` : '') +
+        ` (${ICON_NAMES.length} names exported; see apps/desktop/src/lib/icons.ts)`
+      )
+    }
+    return target[key]
+  }
+})

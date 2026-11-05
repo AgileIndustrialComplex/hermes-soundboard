@@ -1398,6 +1398,67 @@ check('a profile of the wrong shape is dropped, not crashed on', () => {
   storage.delete('profiles')
 })
 
+// ── every screen renders with real SDK icons ────────────────────────────
+// React error #130 ("element type is invalid") is what a missing `icons.X`
+// looks like at runtime, and it only surfaces on the screen that renders that
+// icon. The stub now throws on unknown names, so importing the bundled plugin
+// is already a check — but render each surface too, because a bad icon inside a
+// profile row only appears once a profile exists.
+storage.set('sounds', JSON.stringify([
+  { id: 'snd-i1', name: 'IconCue', kind: 'synth', synth: 'pop', triggers: ['turn.complete'] }
+]))
+storage.set('settings', JSON.stringify({ volume: 70 }))
+storage.delete('profiles')
+const iconBoot = makeCtx()
+plugin.register(iconBoot.ctx)
+const iconEngine = iconBoot.ctx.__engine
+iconEngine.saveProfile('WithIcons')
+
+check('the settings page renders with a saved profile', () => {
+  // Settings pages go through registerSettingsPage, not contributions.
+  const settingsPage = iconBoot.settingsPages.find(page => page.id === 'settings')
+  if (!settingsPage) throw new Error('no settings page registered')
+  const mounted = mount(settingsPage.render())
+  const rows = mounted.host.querySelectorAll('.hermes-sb-profile-row')
+  if (!rows.length) throw new Error('the profile row did not render')
+  // The delete button is inside the row and is what carried the bad icon.
+  const del = mounted.host.querySelector('.hermes-sb-profile-delete')
+  if (!del) throw new Error('the delete-profile button did not render')
+  if (!del.querySelector('[data-icon]')) throw new Error('the delete button rendered no icon')
+  mounted.unmount()
+})
+
+check('the popover renders with a saved profile', () => {
+  const panel = iconBoot.contributions.find(c => c.area === 'statusBar.right')
+  const mounted = mount(panel.render())
+  click(mounted.host.querySelector('button'))
+  const pads = mounted.host.querySelectorAll('.hermes-sb-pad')
+  if (!pads.length) throw new Error('no pads rendered')
+  if (!mounted.host.querySelector('.hermes-sb-profile-btn')) throw new Error('no profile switcher')
+  mounted.unmount()
+})
+
+check('every icon the plugin references exists in the SDK', () => {
+  // Belt and braces: read plugin.js as text so a name reached only on an
+  // untested branch still fails here. The valid set is the real export list the
+  // stub enforces, parsed straight out of the stub so the two cannot diverge.
+  const source = fs.readFileSync(path.join(here, '..', 'plugin.js'), 'utf8')
+  const stub = fs.readFileSync(path.join(here, 'sdk-stub.mjs'), 'utf8')
+  const listMatch = stub.match(/const ICON_NAMES = '([^']+)'\.split/)
+  if (!listMatch) throw new Error('could not read ICON_NAMES from the stub')
+  const valid = new Set(listMatch[1].split(','))
+  const used = [...new Set([...source.matchAll(/icons\.([A-Za-z0-9_]+)/g)].map(m => m[1]))]
+  const missing = used.filter(name => !valid.has(name))
+  if (missing.length) {
+    const hints = missing.map(name => {
+      const close = [...valid].filter(v => v.startsWith(name) || name.startsWith(v))
+      return close.length ? `${name} (did you mean ${close.join('/')}?)` : name
+    })
+    throw new Error(`missing from the SDK: ${hints.join(', ')}`)
+  }
+})
+iconBoot.dispose()
+
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 
 const failed = results.filter(row => !row.ok)

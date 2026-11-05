@@ -3742,7 +3742,7 @@ function ProfileManager({ engine }) {
                     engine.deleteProfile(profile.id)
                     engine.notify({ kind: 'info', message: t('profileDeleted').replace('{name}', profile.name) })
                   },
-                  children: jsx(icons.Trash, { size: 11 })
+                  children: jsx(icons.Trash2, { size: 11 })
                 })
               ]
             }, profile.id)
