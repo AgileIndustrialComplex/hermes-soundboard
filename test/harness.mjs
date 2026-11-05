@@ -966,12 +966,21 @@ ytCtx.ctx.files.writeText = async (folder, path, text, opts) => {
   }
   return out
 }
+// MIRROR THE REAL HOST. mimeFor() in plugin-files-ops.ts only knows IMAGE
+// extensions and falls through to application/octet-stream — so an .mp3 comes
+// back mislabelled. Stubbing a correct 'audio/mpeg' here is what hid a pad that
+// only played after a plugin reload.
 ytCtx.ctx.files.readDataUrl = async (_folder, path) => {
-  if (path.endsWith('.mp3')) return { ok: true, url: 'data:audio/mpeg;base64,' + Buffer.from('FAKE-MP3'.repeat(40)).toString('base64') }
+  if (path.endsWith('.mp3')) {
+    const mime = path.endsWith('.mp3') ? 'application/octet-stream' : 'image/png'
+    return { ok: true, url: `data:${mime};base64,` + Buffer.from('FAKE-MP3'.repeat(40)).toString('base64') }
+  }
   return { ok: false, error: 'not-found', message: path }
 }
 
 const ytPadsBefore = ytMount.host.querySelectorAll('.hermes-sb-pad').length
+// The imported pad's id, captured for the playback-cache assertions below.
+let ytSoundId = null
 typeInto(urlInput(), 'https://www.youtube.com/watch?v=jNQXAC9IVRw')
 click(goButton())
 // The poll interval is 700ms, so give the stub job a couple of ticks.
@@ -988,7 +997,36 @@ check('a valid link writes a job script, runs it, and lands a pad', () => {
   const yt = saved.find(sound => /^YouTube/.test(sound.name))
   if (!yt) throw new Error(`no YouTube pad in ${saved.map(s => s.name).join(', ')}`)
   if (yt.mime !== 'audio/mpeg') throw new Error(`mime=${yt.mime}`)
+  ytSoundId = yt.id
 })
+
+// ── an imported pad must be playable WITHOUT a plugin reload ────────────
+// The reported bug: after importing from YouTube the pad stayed silent until
+// the plugin was reloaded. Cause: readDataUrl labels a .mp3 as
+// application/octet-stream, the URL was cached as-is, and Chromium would not
+// decode it. A reload emptied the cache and playFile re-read the blob with
+// sound.mime, which worked — so the reload masked it.
+check('the cached URL for an imported clip carries an audio MIME', async () => {
+  const saved = JSON.parse(storage.get('sounds') || '[]')
+  const yt = saved.find(s => /^YouTube/.test(s.name))
+  if (!yt) throw new Error('no imported pad is stored')
+  const url = ytCtx.ctx.__engine.peekCachedUrl(yt.id)
+  if (!url) throw new Error('nothing was cached, so this proves nothing')
+  if (!/^data:audio\/mpeg;base64,/.test(url)) {
+    throw new Error(`cached as ${url.slice(0, 46)}… — a non-audio MIME will not decode`)
+  }
+})
+
+check('the cached bytes are the clip, not a re-encode', () => {
+  const saved = JSON.parse(storage.get('sounds') || '[]')
+  const yt = saved.find(s => /^YouTube/.test(s.name))
+  if (!yt) throw new Error('no imported pad is stored')
+  const url = ytCtx.ctx.__engine.peekCachedUrl(yt.id)
+  const stored = files.get(`${yt.id}.b64`)
+  if (stored === undefined) throw new Error('the blob was not written')
+  if (url.split(',')[1] !== stored.trim()) throw new Error('the cached payload differs from the stored blob')
+})
+
 
 check('the progress bar is gone once the import finishes', () => {
   // A bar stuck at 100% would be as confusing as no bar at all.

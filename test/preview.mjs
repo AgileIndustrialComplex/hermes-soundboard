@@ -178,9 +178,12 @@ const ctx = {
       }
       return { ok: true, path, size: text.length, mtimeMs: 0 }
     },
+    // Mirror the desktop host: mimeFor() only maps IMAGE extensions, so an .mp3
+    // is labelled application/octet-stream. Returning 'audio/mpeg' here would
+    // hide the bug that made an imported pad silent until a plugin reload.
     readDataUrl: async (_folder, path) =>
       path.endsWith('.mp3')
-        ? { ok: true, url: 'data:audio/mpeg;base64,' + window.__realClip }
+        ? { ok: true, url: 'data:application/octet-stream;base64,' + window.__realClip }
         : { ok: false, error: 'not-found', message: path },
     trash: async (_folder, path) => {
       window.__files.delete(path)
@@ -896,6 +899,11 @@ const playState = await page.evaluate(async () => {
   }
 })
 console.log(`imported pad playback: ${JSON.stringify(playState)}`)
+// The cached URL must be labelled as audio: the host labels an .mp3 as
+// application/octet-stream, and a reload used to mask that by re-reading it.
+if (playState.srcPrefix && !/^data:audio\/mpeg/.test(playState.srcPrefix)) {
+  console.log(`!! the pad's source is mislabelled: ${playState.srcPrefix}`)
+}
 if (playState.error) console.log(`!! ${playState.error}`)
 else if (!(playState.currentTime > 0)) console.log('!! the pad produced no audible progress')
 else console.log(`  audible: advanced to ${playState.currentTime.toFixed(2)}s of ${(playState.duration || 0).toFixed(2)}s`)

@@ -788,6 +788,23 @@ function cleanActiveId(raw, list) {
   return id && list.some(profile => profile.id === id) ? id : null
 }
 
+/** Rebuild a data URL with a MIME we know, keeping the bytes.
+ *
+ * `ctx.files.readDataUrl` stamps the URL with a MIME it derives from the file
+ * extension — but the desktop host's table only covers IMAGE types
+ * (`mimeFor()` in plugin-files-ops.ts falls through to
+ * `application/octet-stream`). So an .mp3 comes back as
+ * `data:application/octet-stream;base64,...`, and Chromium refuses to decode it.
+ * The result is a pad that is silently dead until the plugin is reloaded, at
+ * which point the cache is empty and playFile re-reads the blob as text and
+ * builds the URL with `sound.mime` — which is why reloading "fixed" it.
+ */
+function withMime(url, mime) {
+  const comma = String(url).indexOf(',')
+
+  return comma < 0 ? url : `data:${mime};base64,${String(url).slice(comma + 1)}`
+}
+
 function newId() {
   const uuid = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)
 
@@ -1451,7 +1468,9 @@ function createEngine(ctx) {
       await files.trash?.(files.dataFolder, name)
     }
 
-    urls.set(id, audio.url)
+    // NOT audio.url directly: readDataUrl labels an .mp3 as
+    // application/octet-stream, which will not decode.
+    urls.set(id, withMime(audio.url, 'audio/mpeg'))
     persistSounds([...sounds.get(), sound])
     onStage?.('done')
     ytJob.set(null)
@@ -2037,6 +2056,8 @@ function createEngine(ctx) {
     remove,
     profiles,
     activeProfile,
+    /** Test seam: the cached playback URL for a pad, or null. Read-only. */
+    peekCachedUrl: soundId => urls.get(soundId) ?? null,
     saveProfile,
     applyProfile,
     renameProfile,
