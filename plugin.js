@@ -407,9 +407,13 @@ function parseYoutube(value) {
 let toolsProbe = null
 
 class ImportError extends Error {
-  constructor(code, message) {
-    super(message)
+  /** `code` is a stable machine token; `message`, when given, is already the
+   *  sentence a person should read. `details` carries the numbers a caller
+   *  needs to build that sentence itself (a version, a count). */
+  constructor(code, message = '', details = null) {
+    super(message || code)
     this.code = code
+    this.details = details
   }
 }
 
@@ -804,6 +808,186 @@ function baseName(fileName) {
   return String(fileName || 'Sound').replace(/\.[^.]+$/, '')
 }
 
+// ── setup files: export / import a whole board ────────────────────────────
+// One JSON file holds the pads — names, gains, trigger bindings, order — plus
+// the settings that shape the panel. Audio rides along as base64, which is what
+// the plugin already stores, so a shared setup is a single mail-able file with
+// no second folder to keep beside it.
+//
+// Nothing is trusted coming back in: an imported record goes through the SAME
+// `cleanSound`/`cleanSettings` sanitisers storage does, ids are minted fresh on
+// this machine (a file never dictates one), and every clip is size- and
+// alphabet-checked before it is written. A bundle therefore cannot carry a pad
+// whose clip would not decode, or a trigger id this build does not know.
+const BUNDLE_FORMAT = 'hermes-soundboard-setup'
+const BUNDLE_VERSION = 1
+/** Parsed whole in the renderer, so it is capped: a corrupt or hostile file
+ *  must not lock the window up. The cap is derived from what this app can
+ *  itself produce — 40 pads × the 3 MiB clip limit, base64-inflated by 4/3 —
+ *  so a board can never export a file its own importer would refuse. */
+const MAX_IMPORT_BYTES = Math.ceil(MAX_SOUNDS * MAX_FILE_BYTES * (4 / 3)) + 2 * 1024 * 1024
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/
+
+/** Decoded byte count of a base64 string, or -1 when it is not base64. */
+function b64Bytes(text) {
+  if (typeof text !== 'string' || !text || text.length % 4 !== 0 || !B64_RE.test(text)) return -1
+  const padding = text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0
+
+  return (text.length * 3) / 4 - padding
+}
+
+function dayStamp(date = new Date()) {
+  const pad = value => String(value).padStart(2, '0')
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/** The setup file's shape. Deliberately NO ids: an id is a local address, not
+ *  part of a setup, and carrying one across machines only invites a collision
+ *  with a pad that already lives there. */
+function buildBundle({ sounds, settings, audio }) {
+  return {
+    format: BUNDLE_FORMAT,
+    version: BUNDLE_VERSION,
+    app: 'Soundboard',
+    exportedAt: new Date().toISOString(),
+    settings: cleanSettings(settings),
+    sounds: sounds.map(sound => {
+      const entry = { name: sound.name, kind: sound.kind }
+      if (sound.kind === 'synth') entry.synth = sound.synth
+      else {
+        entry.mime = sound.mime
+        entry.audio = audio.get(sound.id) ?? null
+      }
+      // 100% is the neutral default and is stored as an ABSENT field, exactly
+      // as it is in storage, so an exported board matches the board it came
+      // from field for field.
+      if (Number.isFinite(sound.gain) && sound.gain !== 100) entry.gain = sound.gain
+      if (sound.triggers?.length) entry.triggers = [...sound.triggers]
+      return entry
+    })
+  }
+}
+
+function hasSettings(raw) {
+  if (!raw || typeof raw !== 'object') return false
+
+  return ['volume', 'showLabel', 'padsPerRow', 'oneAtATime'].some(key => key in raw)
+}
+
+/** Validate a setup file. Every sound comes back sanitised with its clip's
+ *  byte count measured; anything unplayable is counted, never stored mute.
+ *  Throws an ImportError carrying a code (never a code shown to a person). */
+function parseBundle(text) {
+  let data
+  try {
+    data = JSON.parse(String(text ?? ''))
+  } catch {
+    throw new ImportError('notJson')
+  }
+  if (!data || typeof data !== 'object' || data.format !== BUNDLE_FORMAT) throw new ImportError('notBundle')
+  const version = Number(data.version)
+  if (!Number.isFinite(version) || version < 1) throw new ImportError('notBundle')
+  if (version > BUNDLE_VERSION) throw new ImportError('newer', '', { version })
+
+  const list = Array.isArray(data.sounds) ? data.sounds : []
+  const sounds = []
+  let skippedNoAudio = 0
+
+  for (const raw of list.slice(0, MAX_SOUNDS * 2)) {
+    if (!raw || typeof raw !== 'object') continue
+    // Same sanitiser storage uses, so a hand-edited file cannot smuggle in a
+    // field this build does not understand.
+    const clean = cleanSound({
+      id: 'imported',
+      name: raw.name,
+      kind: raw.kind,
+      synth: raw.synth,
+      mime: raw.mime,
+      gain: raw.gain,
+      triggers: raw.triggers
+    })
+    if (!clean) continue
+    if (clean.kind === 'synth') {
+      sounds.push({ ...clean, id: null })
+      continue
+    }
+    const audio = String(raw.audio ?? '').replace(/\s+/g, '')
+    const bytes = b64Bytes(audio)
+    // Empty, not base64, or over the per-pad cap: the pad could never make a
+    // sound here, so it is reported as skipped rather than added silent.
+    if (bytes <= 0 || bytes > MAX_FILE_BYTES) {
+      skippedNoAudio += 1
+      continue
+    }
+    sounds.push({ ...clean, id: null, bytes, audio })
+  }
+
+  if (!sounds.length) throw new ImportError('empty', '', { skippedNoAudio })
+
+  return {
+    exportedAt: typeof data.exportedAt === 'string' ? data.exportedAt : null,
+    settings: hasSettings(data.settings) ? cleanSettings(data.settings) : null,
+    sounds,
+    skippedNoAudio
+  }
+}
+
+/** What an import WOULD do, so the user confirms a plan rather than a guess.
+ *  `total` counts every playable pad in the file (including ones a full board
+ *  could not take), and `taken` is this board's pad count at parse time — the
+ *  caller compares the two, so an overflow is visible instead of arriving as a
+ *  quietly shorter board. */
+function planImport(text, taken) {
+  const bundle = parseBundle(text)
+  const entries = bundle.sounds.slice(0, MAX_SOUNDS)
+
+  return {
+    exportedAt: bundle.exportedAt,
+    settings: bundle.settings,
+    entries,
+    taken: Math.max(0, Math.round(Number(taken) || 0)),
+    total: bundle.sounds.length,
+    tooManyForBoard: bundle.sounds.length - entries.length,
+    skippedNoAudio: bundle.skippedNoAudio,
+    fileName: ''
+  }
+}
+
+/** Hand a file to the browser's own download path. Electron's main process
+ *  answers with the app's save dialog (defaulting to Downloads), which is the
+ *  only export door that lands somewhere the user can find and mail. Returns
+ *  false rather than throwing when the door is unavailable, so the caller can
+ *  fall back to the folder it definitely can write. */
+function downloadFile(fileName, text) {
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = fileName
+    link.rel = 'noopener'
+    link.style.display = 'none'
+    document.body.append(link)
+    link.click()
+    link.remove()
+    // Revoking in the same tick cancels the transfer in some Chromium builds.
+    setTimeout(() => URL.revokeObjectURL(url), 60000)
+
+    return true
+  } catch {
+    return false
+  }
+}
+
+function readAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(reader.error ?? new Error('Could not read that file.'))
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
+    reader.readAsText(file)
+  })
+}
+
 // ── engine ────────────────────────────────────────────────────────────────
 // All playback, persistence and file I/O lives here; components only read
 // atoms and call verbs. Handlers read atoms imperatively (`.get()`), never
@@ -853,6 +1037,25 @@ function createEngine(ctx) {
 
   function isChainedStart() {
     return Date.now() - lastCompleteAt < CHAIN_WINDOW_MS
+  }
+
+  /** Most recent pick per trigger, so a random choice does not immediately
+   *  repeat itself. With only two candidates, plain uniform random plays the
+   *  same sound twice in a row half the time, which does not read as random to
+   *  the person listening. Skipping the previous pick keeps every remaining
+   *  sound equally likely, so it is still uniform — just without the echo. */
+  const lastPick = new Map()
+
+  function pickOne(candidates, triggerId) {
+    if (candidates.length === 1) return candidates[0]
+    const previous = lastPick.get(triggerId)
+    const pool = candidates.length > 2 && previous
+      ? candidates.filter(sound => sound.id !== previous)
+      : candidates
+    const chosen = pool[Math.floor(Math.random() * pool.length)]
+    lastPick.set(triggerId, chosen.id)
+
+    return chosen
   }
 
   /** Master volume × this pad's own trim, clamped to something playable. */
@@ -1002,19 +1205,25 @@ function createEngine(ctx) {
     // A triggered cue is monophonic under the same setting: whatever else is
     // still sounding stops before this one starts.
     if (settings.get().oneAtATime) stopVoices()
-    let fired = 0
-    for (const sound of bound()) {
-      if (!sound.triggers.includes(triggerId)) continue
-      flash(sound.id)
-      fired += 1
-      const gain = gainFor(sound)
-      if (gain <= 0) continue
+    const candidates = bound().filter(sound => sound.triggers.includes(triggerId))
+    if (!candidates.length) {
+      // A trigger with no pad bound to it is not "the last trigger" — the
+      // readout should name something that actually made a sound.
+      lastTrigger.set(null)
+      return
+    }
+
+    // ONE pad per trigger, chosen at random. Several pads can answer to the
+    // same event, and playing them all at once turned those into a chord —
+    // which is rarely what a soundboard is for. The pick also decides which pad
+    // flashes, so the lit pad is always the one you heard.
+    const sound = pickOne(candidates, triggerId)
+    flash(sound.id)
+    const gain = gainFor(sound)
+    if (gain > 0) {
       if (sound.kind === 'synth') playSynth(sound.synth, gain)
       else void playFile(sound, gain).catch(() => {})
     }
-    // A trigger with no pad bound to it is not "the last trigger" — the
-    // readout should name something that actually made a sound.
-    if (!fired) lastTrigger.set(null)
   }
 
   // One subscription per distinct event, not per binding: several pads can hang
@@ -1452,6 +1661,163 @@ function createEngine(ctx) {
     persistSounds([...sounds.get(), ...missing.map(sound => ({ ...sound, id: `synth-${sound.synth}-${Date.now().toString(36)}` }))])
   }
 
+  /** Collect every pad's clip, then write one setup file.
+   *
+   *  Two doors, tried in this order: the browser's download path (Electron
+   *  turns it into the app's save dialog, defaulting to Downloads) and, when
+   *  that is unavailable, the plugin's own data folder — always writable, so an
+   *  export never ends in "nothing happened". A clip that cannot be read is
+   *  counted and named rather than silently left out: a setup missing a sound
+   *  is worse than one that says so.
+   */
+  async function exportBundle({ toFolder = false } = {}) {
+    const files = ctx.files
+    const current = sounds.get()
+    const audio = new Map()
+    const missing = []
+
+    for (const sound of current) {
+      if (sound.kind !== 'file') continue
+      if (!files) {
+        missing.push(sound.name)
+        continue
+      }
+      const read = await files.readText(files.dataFolder, `${sound.id}.b64`)
+      const text = read.ok ? String(read.text ?? '').replace(/\s+/g, '') : ''
+      if (!text) {
+        missing.push(sound.name)
+        continue
+      }
+      audio.set(sound.id, text)
+    }
+
+    const bundle = buildBundle({ sounds: current, settings: settings.get(), audio })
+    const text = JSON.stringify(bundle, null, 1)
+    const fileName = `soundboard-setup-${dayStamp()}.json`
+    const size = new TextEncoder().encode(text).length
+
+    let savedTo = null
+    let path = null
+    if (toFolder) {
+      if (!files) throw new ImportError('noFileAccess', t('noFileAccess'))
+      const written = await files.writeText(files.dataFolder, fileName, text)
+      if (!written.ok) throw new ImportError('saveFailed', written.message || t('saveFailed'))
+      savedTo = 'folder'
+      path = written.path || fileName
+    } else if (downloadFile(fileName, text)) {
+      savedTo = 'download'
+    } else if (files) {
+      // No download door (an older shell): the data folder is still a real
+      // place on disk, and the toast names the file.
+      const written = await files.writeText(files.dataFolder, fileName, text)
+      if (written.ok) {
+        savedTo = 'folder'
+        path = written.path || fileName
+      }
+    }
+
+    if (!savedTo) throw new ImportError('saveFailed', t('exportFailed'))
+    haptic('tap')
+
+    return { fileName, path, size, pads: bundle.sounds.length, missing, savedTo }
+  }
+
+  /** Parse a setup file and report the plan without touching anything. The
+   *  caller shows it, the user confirms, then `applyBundle` writes it. */
+  function inspectBundle(text) {
+    return planImport(text, sounds.get().length)
+  }
+
+  /** Read a chosen file and return its plan. Split from `inspectBundle` so the
+   *  FileReader (which needs a real DOM) stays in one place. */
+  async function readSetupFile(file) {
+    if (!file) throw new ImportError('noFile')
+    if (file.size > MAX_IMPORT_BYTES) throw new ImportError('tooBig', t('importTooBig'))
+    let text
+    try {
+      text = await readAsText(file)
+    } catch {
+      throw new ImportError('unreadable', t('importUnreadable'))
+    }
+
+    return { ...inspectBundle(text), fileName: String(file.name || '') }
+  }
+
+  /** Write a confirmed plan: clips first, then the pads, then the settings.
+   *
+   *  Ids are minted here, never taken from the file, and names are made unique
+   *  against what the board already holds — an import ADDS to a board rather
+   *  than replacing it, so nobody loses their own pads to someone else's file.
+   *  `mode: 'replace'` is the deliberate exception: the imported set becomes the
+   *  board, and the clips it displaces go to the OS trash (recoverable) instead
+   *  of being left as orphans in the data folder.
+   *
+   *  If a clip write fails the pad is not added at all: a pad that cannot play
+   *  is worse than a pad that was reported as skipped.
+   */
+  async function applyBundle(plan, { includeSettings = true, mode = 'add' } = {}) {
+    const files = ctx.files
+    const entries = Array.isArray(plan?.entries) ? plan.entries : []
+    if (!entries.length) return { added: 0, skipped: 0, removed: 0 }
+    if (entries.some(entry => entry.kind === 'file') && !files) {
+      throw new ImportError('noFileAccess', t('noFileAccess'))
+    }
+    const replace = mode === 'replace'
+    const existing = sounds.get()
+    // ADD mode can only take what is left of the board's 40-pad budget; the
+    // rest is reported back rather than dropped in silence. REPLACE mode has the
+    // whole budget (the file was capped at MAX_SOUNDS when it was planned).
+    const room = replace ? MAX_SOUNDS : Math.max(0, MAX_SOUNDS - existing.length)
+    const wanted = entries.slice(0, room)
+    if (!wanted.length) return { added: 0, skipped: 0, removed: 0, refused: entries.length }
+
+    const added = []
+    let skipped = 0
+    for (const entry of wanted) {
+      const id = newId()
+      if (entry.kind === 'file') {
+        const written = await files.writeText(files.dataFolder, `${id}.b64`, entry.audio)
+        if (!written.ok) {
+          skipped += 1
+          continue
+        }
+      }
+      const sound = {
+        id,
+        name: uniqueName(entry.name, (replace ? added : [...existing, ...added]).map(item => item.name)),
+        kind: entry.kind
+      }
+      if (entry.kind === 'synth') sound.synth = entry.synth
+      else {
+        sound.mime = entry.mime
+        sound.bytes = entry.bytes
+      }
+      if (Number.isFinite(entry.gain) && entry.gain !== 100) sound.gain = entry.gain
+      if (entry.triggers?.length) sound.triggers = entry.triggers
+      added.push(sound)
+    }
+
+    let removed = 0
+    if (replace) {
+      for (const sound of existing) {
+        if (sound.kind === 'file' && files) {
+          void files.trash(files.dataFolder, `${sound.id}.b64`).catch(() => {})
+        }
+        urls.delete(sound.id)
+        removed += 1
+      }
+      if (added.length) persistSounds(added)
+      else removed = 0
+    } else if (added.length) {
+      persistSounds([...existing, ...added])
+    }
+
+    if (includeSettings && plan.settings) persistSettings(plan.settings)
+    haptic('tap')
+
+    return { added: added.length, skipped, removed: replace ? removed : 0, refused: entries.length - wanted.length }
+  }
+
   ctx.onDispose(() => {
     disposed = true
     for (const timer of timers.values()) clearTimeout(timer)
@@ -1490,6 +1856,10 @@ function createEngine(ctx) {
     ytJob,
     notify,
     restorePresets,
+    exportBundle,
+    inspectBundle,
+    readSetupFile,
+    applyBundle,
     setVolume: volume => persistSettings({ volume }),
     setShowLabel: showLabel => persistSettings({ showLabel }),
     setPadsPerRow: padsPerRow => persistSettings({ padsPerRow }),
@@ -1708,6 +2078,72 @@ const CSS = `
   font-size:7px;line-height:8px;font-weight:700;
   color:var(--ui-bg-primary);background-color:var(--ui-text-tertiary)}
 .hermes-sb-body{position:relative}
+/* Setup export / import. A quiet row at the foot of the panel: two bordered
+   buttons the same height as the panel's other controls, no accent fill — the
+   accent appears only on the plan's committing button and on hover. */
+.hermes-sb-setup{margin-top:6px;padding-top:6px;border-top:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-setup-row{display:flex;align-items:center;gap:4px;padding:0 2px}
+.hermes-sb-setup-title{font-size:9px;line-height:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-quaternary);white-space:nowrap}
+.hermes-sb-setup-spacer{flex:1;min-width:0}
+.hermes-sb-setup-btn{display:inline-flex;align-items:center;gap:3px;height:20px;box-sizing:border-box;flex-shrink:0;
+  padding:0 6px;border-radius:3px;font:inherit;font-size:10px;line-height:13px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-setup-btn:hover:not(:disabled){border-color:var(--ui-stroke-primary);color:var(--ui-text-primary)}
+.hermes-sb-setup-btn:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
+.hermes-sb-setup-btn:disabled{opacity:.5;cursor:default}
+.hermes-sb-setup-btn[data-primary=true]{border-color:var(--ui-accent);color:var(--ui-accent)}
+.hermes-sb-setup-btn[data-primary=true]:hover:not(:disabled){color:var(--ui-text-primary);
+  background-color:color-mix(in srgb,var(--ui-accent) 16%,var(--ui-bg-tertiary))}
+.hermes-sb-setup-note{padding:4px 4px 0;font-size:9px;line-height:12px;color:var(--ui-text-quaternary)}
+/* The plan a picked file would apply. Opaque and inset like the trim row, so it
+   reads as a confirmation block rather than another line of chrome. */
+.hermes-sb-setup-plan{margin:5px 2px 0;padding:5px 6px;border-radius:4px;
+  background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-setup-plan-title{font-size:10px;line-height:14px;color:var(--ui-text-primary);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-sb-setup-plan-warn{padding-top:3px;font-size:10px;line-height:13px;color:var(--ui-text-secondary)}
+.hermes-sb-setup-plan-warn::before{content:"! ";color:var(--ui-accent);font-weight:700}
+/* Add / replace: two quiet radio buttons, the chosen one marked by the accent
+   BORDER rather than a fill — a filled block in a 271px panel reads as a
+   button that has already been pressed. */
+.hermes-sb-setup-modes{display:flex;align-items:center;gap:3px;flex-wrap:wrap;padding-top:4px}
+.hermes-sb-setup-mode{display:inline-flex;align-items:center;height:18px;box-sizing:border-box;
+  padding:0 6px;border-radius:999px;font:inherit;font-size:9px;line-height:11px;
+  color:var(--ui-text-tertiary);background-color:transparent;
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-setup-mode:hover:not(:disabled){color:var(--ui-text-primary);border-color:var(--ui-stroke-primary)}
+.hermes-sb-setup-mode[data-selected=true]{color:var(--ui-text-primary);border-color:var(--ui-accent)}
+.hermes-sb-setup-mode[data-selected=true][data-destructive=true]{color:var(--ui-red);
+  border-color:color-mix(in srgb,var(--ui-red) 65%,var(--ui-stroke-secondary))}
+.hermes-sb-setup-mode:disabled{opacity:.5;cursor:default}
+.hermes-sb-setup-check{display:flex;align-items:flex-start;gap:5px;padding-top:4px;
+  font-size:10px;line-height:13px;color:var(--ui-text-tertiary);cursor:pointer}
+.hermes-sb-setup-check input{margin:1px 0 0;flex-shrink:0;accent-color:var(--ui-accent)}
+/* The label is the widest text in the block and will wrap at this width; it
+   wraps as a paragraph under its own checkbox instead of being squeezed to the
+   right, which is what made an orphaned fragment sit away from the box. */
+.hermes-sb-setup-check span{flex:1;min-width:0}
+.hermes-sb-setup-confirm{display:flex;align-items:center;gap:4px;padding-top:5px}
+/* Same rule as every other row status: a failure is the most readable thing in
+   its block, wrapped, with a marker — never the dimmest 9px tone. */
+.hermes-sb-setup-error{margin:5px 2px 0;padding:4px 6px 4px 16px;border-radius:4px;position:relative;
+  font-size:10px;line-height:14px;color:var(--ui-text-secondary);white-space:normal;
+  background-color:color-mix(in srgb,var(--ui-red) 12%,transparent)}
+.hermes-sb-setup-error::before{content:"!";position:absolute;left:5px;top:6px;
+  width:8px;height:8px;border-radius:50%;text-align:center;
+  font-size:7px;line-height:8px;font-weight:700;
+  color:var(--ui-bg-primary);background-color:var(--ui-red)}
+/* On the settings page the same component sits in a normal flow column, not a
+   308px popover, so it loses the hairline and gains a readable body size. */
+.hermes-sb-setup[data-page=true]{margin-top:0;padding-top:0;border-top:0;max-width:420px}
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-title{font-size:11px;letter-spacing:.04em;color:var(--ui-text-secondary)}
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-btn{height:24px;font-size:11px;padding:0 9px}
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-note,
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-plan-title,
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-plan-warn,
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-check,
+.hermes-sb-setup[data-page=true] .hermes-sb-setup-error{font-size:12px;line-height:16px}
 `
 
 // ── UI ────────────────────────────────────────────────────────────────────
@@ -2126,6 +2562,256 @@ function ManageRow({ sound, engine }) {
   }, sound.id)
 }
 
+// ── setup export / import ─────────────────────────────────────────────────
+// The board is one file: pads, gains, bindings and the settings that shape the
+// panel. That is what makes a setup shareable — one attachment, no folder of
+// loose mp3s to keep beside it.
+
+/** A setup failure is either a localised ImportError (already a sentence) or
+ *  something unexpected. Either way the user gets words, never a bare code. */
+function describeSetupError(error, t) {
+  const code = error?.code
+  if (code === 'notJson') return t('importNotJson')
+  if (code === 'notBundle') return t('importNotBundle')
+  if (code === 'newer') return t('importNewer', error?.details?.version ?? '?')
+  if (code === 'empty') return t('importEmpty')
+  if (code === 'tooBig') return t('importTooBig')
+  if (code === 'unreadable') return t('importUnreadable')
+  if (code === 'noFile') return t('importUnreadable')
+  if (code === 'noFileAccess') return t('noFileAccess')
+  if (code === 'saveFailed') return t('exportFailed')
+  if (code === 'noSession') return t('ytNoSession')
+
+  return error instanceof Error && error.message && error.message !== code
+    ? error.message
+    : t('setupFailed')
+}
+
+function SetupBar({ engine, page = false }) {
+  const t = usePluginI18n(ID)
+  const sounds = useValue(engine.sounds)
+  const [plan, setPlan] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [withSettings, setWithSettings] = useState(true)
+  const [mode, setMode] = useState('add')
+  const fileRef = useRef(null)
+
+  const run = async action => {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    try {
+      await action()
+    } catch (failure) {
+      const message = describeSetupError(failure, t)
+      setError(message)
+      // Also a toast: exporting usually closes the panel on the way out.
+      engine.notify({ kind: 'error', message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const doExport = () =>
+    run(async () => {
+      const result = await engine.exportBundle()
+      // Two doors, two honest sentences: the download path leaves the save
+      // decision with the user (they can still cancel that dialog), while the
+      // folder path has already written the file and can name it.
+      const message = result.savedTo === 'folder'
+        ? t('exportedTo', result.path || result.fileName)
+        : t('exportedAsk', result.fileName)
+      const warning = result.missing.length ? ` ${t('exportMissing', result.missing.length, result.missing.join(', '))}` : ''
+      engine.notify({ kind: result.missing.length ? 'warning' : 'info', message: `${message}${warning}` })
+    })
+
+  const takeSetup = file => {
+    if (!file) return
+    void run(async () => {
+      const found = await engine.readSetupFile(file)
+      setPlan(found)
+      setWithSettings(Boolean(found.settings))
+      setMode('add')
+    })
+  }
+
+  const doImport = () =>
+    run(async () => {
+      const result = await engine.applyBundle(plan, {
+        includeSettings: withSettings && Boolean(plan.settings),
+        mode
+      })
+      setPlan(null)
+      const parts = [t('imported', result.added)]
+      if (result.removed) parts.push(t('importReplaced', result.removed))
+      // A pad the file carried but this board could not take is reported AFTER
+      // the fact too: the plan is gone by then, and "1 pad added" out of a file
+      // that held two is a silent loss without this line.
+      if (plan.skippedNoAudio) parts.push(t('importNoAudio', plan.skippedNoAudio))
+      if (result.skipped) parts.push(t('importWriteFailed', result.skipped))
+      if (result.refused) parts.push(t('importRefused', result.refused))
+      const kind = result.skipped || result.refused || plan.skippedNoAudio || !result.added ? 'warning' : 'info'
+      engine.notify({ kind, message: parts.join(' ') })
+    })
+
+  const startingNow = plan ? plan.taken : sounds.length
+  const room = Math.max(0, MAX_SOUNDS - startingNow)
+  const fits = mode === 'replace' ? plan?.entries.length ?? 0 : Math.min(room, plan?.entries.length ?? 0)
+  const overflow = (plan?.entries.length ?? 0) - fits
+
+  return jsxs('div', {
+    className: 'hermes-sb-setup',
+    'data-page': page ? 'true' : undefined,
+    children: [
+      jsxs('div', {
+        className: 'hermes-sb-setup-row',
+        children: [
+          jsx('span', { className: 'hermes-sb-setup-title', children: t('setup') }),
+          jsx('span', { className: 'hermes-sb-setup-spacer' }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-setup-btn',
+            'aria-label': t('exportSetup'),
+            title: t('exportHint'),
+            disabled: busy,
+            onClick: () => void doExport(),
+            children: [
+              jsx(icons.Upload, { size: 10, 'aria-hidden': true }),
+              jsx('span', { children: busy ? t('working') : t('exportSetup') })
+            ]
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-setup-btn',
+            'aria-label': t('importSetup'),
+            title: t('importHint'),
+            disabled: busy,
+            onClick: () => fileRef.current?.click(),
+            children: [
+              jsx(icons.Download, { size: 10, 'aria-hidden': true }),
+              jsx('span', { children: t('importSetup') })
+            ]
+          })
+        ]
+      }),
+      jsx('input', {
+        ref: fileRef,
+        type: 'file',
+        accept: 'application/json,.json',
+        style: { display: 'none' },
+        'aria-label': t('importSetup'),
+        onChange: event => {
+          // `input.files` is LIVE: snapshot before clearing `value`, or picking
+          // the same setup twice never fires `change`.
+          const [file] = [...event.target.files]
+          event.target.value = ''
+          takeSetup(file)
+        }
+      }),
+      plan
+        ? jsxs('div', {
+            className: 'hermes-sb-setup-plan',
+            role: 'group',
+            'aria-label': t('importSetup'),
+            children: [
+              jsx('div', {
+                className: 'hermes-sb-setup-plan-title',
+                children: t('importPlan', plan.fileName || t('thisFile'), plan.total)
+              }),
+              // Where the pads go. ADD is the safe default and is preselected;
+              // REPLACE has to be chosen on purpose, and says what it costs.
+              jsxs('div', {
+                className: 'hermes-sb-setup-modes',
+                role: 'radiogroup',
+                'aria-label': t('importMode'),
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    role: 'radio',
+                    'aria-checked': mode === 'add',
+                    'data-selected': mode === 'add',
+                    className: 'hermes-sb-setup-mode',
+                    disabled: busy,
+                    onClick: () => setMode('add'),
+                    children: t('importModeAdd', sounds.length)
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    role: 'radio',
+                    'aria-checked': mode === 'replace',
+                    'data-selected': mode === 'replace',
+                    'data-destructive': 'true',
+                    className: 'hermes-sb-setup-mode',
+                    disabled: busy,
+                    onClick: () => setMode('replace'),
+                    children: t('importModeReplace', sounds.length)
+                  })
+                ]
+              }),
+              overflow > 0
+                ? jsx('div', {
+                    className: 'hermes-sb-setup-plan-warn',
+                    children: t('importOverflow', overflow, MAX_SOUNDS)
+                  })
+                : null,
+              plan.skippedNoAudio > 0
+                ? jsx('div', {
+                    className: 'hermes-sb-setup-plan-warn',
+                    children: t('importNoAudio', plan.skippedNoAudio)
+                  })
+                : null,
+              plan.settings
+                ? jsxs('label', {
+                    className: 'hermes-sb-setup-check',
+                    children: [
+                      jsx('input', {
+                        type: 'checkbox',
+                        checked: withSettings,
+                        disabled: busy,
+                        onChange: event => setWithSettings(event.target.checked)
+                      }),
+                      jsx('span', { children: t('importSettings', plan.settings.volume, plan.settings.padsPerRow) })
+                    ]
+                  })
+                : null,
+              jsxs('div', {
+                className: 'hermes-sb-setup-confirm',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: 'hermes-sb-setup-btn',
+                    'data-primary': 'true',
+                    disabled: busy || !fits,
+                    onClick: () => void doImport(),
+                    children: t('importAdd', fits)
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: 'hermes-sb-setup-btn',
+                    disabled: busy,
+                    onClick: () => {
+                      setPlan(null)
+                      setError('')
+                    },
+                    children: t('cancel')
+                  })
+                ]
+              })
+            ]
+          })
+        : null,
+      error ? jsx('div', { className: 'hermes-sb-setup-error', role: 'alert', children: error }) : null,
+      !plan && !error
+        ? jsx('div', {
+            className: 'hermes-sb-setup-note',
+            children: t('setupHint')
+          })
+        : null
+    ]
+  })
+}
+
 function Panel({ engine }) {
   const t = usePluginI18n(ID)
   const sounds = useValue(engine.sounds)
@@ -2540,6 +3226,8 @@ function Panel({ engine }) {
           })
         : null,
 
+      jsx(SetupBar, { engine }),
+
       dragging ? jsx('div', { className: 'hermes-sb-drop', children: t('dropHere') }) : null
     ]
   })
@@ -2655,7 +3343,10 @@ function SoundboardSettings({ engine }) {
             children: t('restore')
           })
         ]
-      })
+      }),
+      // The same control the panel carries, in full width: a setup is something
+      // you back up or share once in a while, which is where people look for it.
+      jsx(SetupBar, { engine, page: true })
     ]
   })
 }
@@ -2726,7 +3417,42 @@ const LOCALES = {
     notAudio: 'That file is not an audio file.',
     saveFailed: 'That sound could not be saved.',
     missingAudio: 'That sound file is missing from the plugin folder.',
-    stats: (total, custom) => `${total} pads · ${custom} custom file${custom === 1 ? '' : 's'}`
+    stats: (total, custom) => `${total} pads · ${custom} custom file${custom === 1 ? '' : 's'}`,
+    // ── setup export / import ──
+    setup: 'Setup',
+    setupHint: 'Share this board as one file, or load someone else’s.',
+    exportSetup: 'Export',
+    exportHint: 'Save every pad, its clip and its settings as one file you can share',
+    importSetup: 'Import',
+    importHint: 'Load a setup file someone shared with you',
+    working: 'Working…',
+    exportedTo: name => `Setup saved as “${name}”.`,
+    exportedAsk: name => `“${name}” is ready — save it from the dialog.`,
+    exportMissing: (n, names) =>
+      `${n} clip${n === 1 ? '' : 's'} could not be read, so ${n === 1 ? 'it is' : 'they are'} missing from the file: ${names}.`,
+    exportFailed: 'The setup file could not be saved.',
+    thisFile: 'this file',
+    importPlan: (name, pads) => `“${name}” holds ${pads} pad${pads === 1 ? '' : 's'}`,
+    importMode: 'Where the pads go',
+    importModeAdd: n => `Add to this board (${n} now)`,
+    importModeReplace: n => (n ? `Start fresh (drops ${n})` : 'Start fresh'),
+    importOverflow: (n, max) => `${n} pad${n === 1 ? '' : 's'} will not fit: a board holds ${max}.`,
+    importNoAudio: n => `${n} pad${n === 1 ? '' : 's'} will be skipped — the clip is missing or too large.`,
+    importSettings: (volume, perRow) => `Apply its settings too — ${volume}% volume, ${perRow} per row`,
+    importAdd: n => `Add ${n} pad${n === 1 ? '' : 's'}`,
+    cancel: 'Cancel',
+    imported: n => `Added ${n} pad${n === 1 ? '' : 's'} to this board.`,
+    importReplaced: n => `${n} previous pad${n === 1 ? '' : 's'} replaced.`,
+    importRefused: n => `${n} pad${n === 1 ? '' : 's'} did not fit — use “Start fresh” to take them all.`,
+    importWriteFailed: n =>
+      `${n} clip${n === 1 ? '' : 's'} could not be saved, so ${n === 1 ? 'that pad was' : 'those pads were'} skipped.`,
+    importNotJson: 'That file is not a setup file — it does not contain valid JSON.',
+    importNotBundle: 'That JSON file is not a Soundboard setup.',
+    importNewer: version => `That setup was made by a newer Soundboard (format ${version}). Update Hermes to import it.`,
+    importEmpty: 'That setup has no pads this Soundboard can play.',
+    importTooBig: 'That setup file is too large to read (over 64 MB).',
+    importUnreadable: 'That file could not be read.',
+    setupFailed: 'The setup could not be applied.'
   },
   pl: {
     title: 'Soundboard',
@@ -2789,7 +3515,40 @@ const LOCALES = {
     notAudio: 'To nie jest plik audio.',
     saveFailed: 'Nie udało się zapisać tego dźwięku.',
     missingAudio: 'Brakuje tego pliku dźwiękowego w folderze wtyczki.',
-    stats: (total, custom) => `${total} padów · ${custom} własnych plików`
+    stats: (total, custom) => `${total} padów · ${custom} własnych plików`,
+    // ── setup: eksport / import ──
+    setup: 'Zestaw',
+    setupHint: 'Udostępnij tę tablicę jako jeden plik albo wczytaj cudzą.',
+    exportSetup: 'Eksportuj',
+    exportHint: 'Zapisz wszystkie pady, ich klipy i ustawienia w jednym pliku do udostępnienia',
+    importSetup: 'Importuj',
+    importHint: 'Wczytaj zestaw, który ktoś Ci przesłał',
+    working: 'Pracuję…',
+    exportedTo: name => `Zestaw zapisany jako „${name}”.`,
+    exportedAsk: name => `„${name}” jest gotowy — zapisz go w oknie dialogowym.`,
+    exportMissing: (n, names) => `Nie udało się odczytać ${n} klipu/klipów, więc brakuje ich w pliku: ${names}.`,
+    exportFailed: 'Nie udało się zapisać pliku zestawu.',
+    thisFile: 'ten plik',
+    importPlan: (name, pads) => `„${name}” zawiera ${pads} padów`,
+    importMode: 'Gdzie trafią pady',
+    importModeAdd: n => `Dodaj do tej tablicy (teraz ${n})`,
+    importModeReplace: n => (n ? `Zacznij od nowa (usuwa ${n})` : 'Zacznij od nowa'),
+    importOverflow: (n, max) => `${n} padów się nie zmieści: tablica mieści ${max}.`,
+    importNoAudio: n => `${n} padów zostanie pominiętych — brakuje klipu albo jest za duży.`,
+    importSettings: (volume, perRow) => `Zastosuj też ustawienia — głośność ${volume}%, ${perRow} w rzędzie`,
+    importAdd: n => `Dodaj ${n} padów`,
+    cancel: 'Anuluj',
+    imported: n => `Dodano ${n} padów do tej tablicy.`,
+    importReplaced: n => `Zastąpiono ${n} wcześniejszych padów.`,
+    importRefused: n => `${n} padów się nie zmieściło — użyj „Zacznij od nowa”, aby wziąć wszystkie.`,
+    importWriteFailed: n => `Nie udało się zapisać ${n} klipu/klipów, więc te pady pominięto.`,
+    importNotJson: 'To nie jest plik zestawu — nie zawiera poprawnego JSON-a.',
+    importNotBundle: 'Ten plik JSON nie jest zestawem Soundboardu.',
+    importNewer: version => `Ten zestaw pochodzi z nowszego Soundboardu (format ${version}). Zaktualizuj Hermesa, aby go zaimportować.`,
+    importEmpty: 'Ten zestaw nie ma padów, które ten Soundboard potrafi odtworzyć.',
+    importTooBig: 'Ten plik zestawu jest za duży do odczytu (ponad 64 MB).',
+    importUnreadable: 'Nie udało się odczytać tego pliku.',
+    setupFailed: 'Nie udało się zastosować zestawu.'
   }
 }
 

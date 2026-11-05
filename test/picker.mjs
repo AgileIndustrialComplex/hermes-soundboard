@@ -187,7 +187,9 @@ const check = (name, fn) => {
 
 const state = () => page.evaluate(() => window.__state())
 const padNames = () => page.$$eval('.hermes-sb-pad .hermes-sb-pad-name', nodes => nodes.map(n => n.textContent))
-const fileInput = () => page.locator('.hermes-sb-panel input[type=file]')
+// The audio picker specifically: the panel also carries the setup-import
+// picker, so a bare input[type=file] now matches two elements.
+const fileInput = () => page.locator('.hermes-sb-panel input[type=file][accept*="audio"]')
 
 /** Wait for a condition, but report a FAIL instead of throwing: a regression
  *  here must land in the summary as a named failure, not as a crash. */

@@ -67,6 +67,12 @@ mode all persist per machine.
 - **Drag to reorder.** Pads drag by their body; a line marks where the drop
   lands. Order matters because `1`-`9` fire by position, so dragging is also how
   you choose which key hits which pad.
+- **Share a whole setup.** One `Export` writes the entire board — every pad,
+  its clip, its gain, its trigger bindings, the order and the settings that shape
+  the panel — into a single `.json`. `Import` reads one back and shows you what it
+  would do first: how many pads, whether they fit, which ones would be skipped,
+  and whether to add them to the board or start fresh from the file. See
+  [Sharing a setup](#sharing-a-setup).
 - **Keyboard.** While the panel is focused, `1`–`9` fire the first nine pads and
   `Escape` closes it.
 - **⌘K command.** "Open Soundboard" from the command palette.
@@ -135,6 +141,11 @@ triggers* and a tooltip lists them all. *Clear all triggers* empties the list.
 
 Each entry maps to one real gateway event with a filter, so a pad reacts to "the
 turn finished successfully", not "every `message.complete` frame".
+
+Random choice is uniform, but with three or more candidates it will not pick
+the same pad twice in a row — plain uniform random repeats half the time with
+two pads, which listeners read as "not random". Every remaining pad stays
+equally likely, so the pick is still unbiased.
 
 Stored shape is `triggers: ["turn.complete", …]`. A save written by an earlier
 version holds a single `trigger: "id"` string; it is migrated to a one-entry list
@@ -210,6 +221,55 @@ the WebAudio context can be suspended by the browser's autoplay policy. Every
 trigger attempts a resume; if the platform refuses, the pad still lights up, so
 the cue is never silently lost.
 
+## Sharing a setup
+
+`Export` at the foot of the panel (and on the settings page) collects the whole
+board into one file and hands it to the app's save dialog, defaulting to
+Downloads:
+
+```
+soundboard-setup-2026-11-05.json
+```
+
+Everything a setup *is* travels in it — pad order, names, per-pad gain, trigger
+bindings, the embedded clips themselves, and master volume / label / pads-per-row
+/ one-at-a-time. Clips ride along as base64, the same form the plugin already
+stores them in, so a shared setup is one attachment with no folder of loose mp3s
+to keep beside it.
+
+`Import` runs in two steps, because a setup file is someone else's data:
+
+1. **Pick the file.** Nothing is written yet. The panel shows a plan: how many
+   pads the file holds, a checkbox for *also apply its settings*, and a warning
+   for anything it had to leave out (a clip that is missing, or not base64, or
+   over the 3 MB per-pad cap).
+2. **Confirm.** `Add to this board` (the default) appends the file's pads after
+   yours, skipping any that would pass 40; `Start fresh` replaces the board
+   entirely, moving the clips it displaces to the OS trash.
+
+Two things an import never does: it never reuses a pad id from the file (ids are
+minted on the machine doing the import, so a file cannot overwrite or address an
+existing pad), and it never adds a pad whose clip it could not decode — a silent
+pad is worse than a reported skip. Everything read back goes through the same
+sanitizer storage uses, so a hand-edited or truncated file can only produce pads
+this build already understands.
+
+A setup file is plain JSON and diffable by eye:
+
+```json
+{
+  "format": "hermes-soundboard-setup",
+  "version": 1,
+  "exportedAt": "2026-11-05T18:12:04.881Z",
+  "settings": { "volume": 65, "showLabel": true, "padsPerRow": 4, "oneAtATime": false },
+  "sounds": [
+    { "name": "Pop", "kind": "synth", "synth": "pop" },
+    { "name": "Turn done", "kind": "file", "mime": "audio/mpeg", "gain": 150,
+      "triggers": ["turn.complete"], "audio": "SUQzBAAAAAAA…" }
+  ]
+}
+```
+
 ## Screenshots
 
 ![The soundboard popover](shots/preview-panel.png)
@@ -226,6 +286,8 @@ the cue is never silently lost.
 |---|---|
 | ![Manage mode](shots/preview-manage.png) | ![Settings page](shots/preview-settings.png) |
 | Manage mode — rename, preview, delete | Settings → Plugins → Soundboard |
+
+![An imported setup, before it is applied](shots/preview-setup.png)
 
 All of these are produced by `npm run test:ui`, not by hand.
 
@@ -257,6 +319,9 @@ file). The plugin is enabled by default; it stays off if you toggle it off in
   and base64 inflates by 4/3, so 3 MB is the largest clip that reliably fits.
 - Soundboard clips are meant to be short. Anything long belongs in a player, not
   a pad.
+- A setup file carries every clip, so it is roughly the size of the board's audio
+  (base64 costs another third). The importer refuses anything over 96 MB, which
+  is more than a full 40-pad board can ever weigh.
 
 ## How it is built
 
@@ -284,13 +349,14 @@ throwing inside a render.
 
 ## Test
 
-Three suites, all runnable with `npm test`:
+Four suites, all runnable with `npm test`:
 
 ```bash
-npm test            # all three
-npm run test:unit   # jsdom harness, 38 assertions
+npm test            # all four
+npm run test:unit   # jsdom harness, 72 assertions
 npm run test:picker # real file picker in Chromium, 8 assertions
 npm run test:ui     # render + geometry + a fired trigger in Chromium
+npm run test:setup  # export / import round trip in Chromium, 33 assertions
 ```
 
 **`test/harness.mjs`** bundles
@@ -313,15 +379,27 @@ all. jsdom let the harness assign `files` as a plain static property, so the
 suite passed while the shipped plugin was broken. The suite was confirmed to
 fail (5 checks, 4 failures) against the unfixed code before the fix was restored.
 
+**`test/setup.mjs`** exports a real board through the browser's download path,
+adds a real WAV clip, gives it a gain and a binding, exports again, and imports
+the file back — then asserts the imported **clip actually decodes and plays**
+(`currentTime` advanced, `readyState` past `HAVE_CURRENT_DATA`), not merely that a
+pad appeared. It also covers every refusal path (a `.txt`, foreign JSON, a newer
+format version, a bundle whose clip is not base64, a full board) and checks that
+each one names itself and writes nothing. 33 assertions, and it was confirmed to
+go red against three separate reverted fixes: the per-clip size guard, the
+settings assignment, and byte-exact clip embedding.
+
 **`test/preview.mjs`** renders the same plugin in a real Chromium against the
 app's theme variables and measures the result: pad count, grid columns, and
 whether the header, grid and volume row share one left and one right edge. It
-writes `preview-statusbar.png`, `preview-panel.png`, `preview-manage.png` and
-`preview-settings.png` to `.build/`. That is what catches a layout that reads
+writes `preview-statusbar.png`, `preview-panel.png`, `preview-manage.png`,
+`preview-setup.png` and `preview-settings.png` to `.build/`. The setup row and
+its import plan are measured the same way — button heights, shared baselines,
+containment in the panel, the hint's own left axis. That is what catches a layout that reads
 fine in code and wrong on screen — the padding asymmetry and the orphaned grid
 cell in this plugin were both found that way, not by reading the CSS.
 
-All three borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core`
+All four borrow `esbuild`, `jsdom`, `react`, `react-dom` and `playwright-core`
 from an installed Hermes (`HERMES_DEPS_ROOT` points elsewhere if needed),
 precisely because the plugin itself declares no dependencies and this repository
 has no `node_modules`.

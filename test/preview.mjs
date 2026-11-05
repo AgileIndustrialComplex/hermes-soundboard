@@ -442,6 +442,147 @@ if (columns < 2) console.log('!! pads are NOT laid out in a grid')
 const overflow = panelBox.x < 0 || panelBox.y < 0 || panelBox.x + panelBox.w > 420 || panelBox.y + panelBox.h > 560
 if (overflow) console.log(`!! panel overflows the 420x560 viewport: ${JSON.stringify(panelBox)}`)
 
+// ── the setup (export / import) row ─────────────────────────────────────
+// Measured, not eyeballed: two controls that must share the volume row's left
+// anchor, keep the panel's 21px control height, and stay INSIDE the panel.
+const setupRow = await page.evaluate(() => {
+  const panel = document.querySelector('.hermes-sb-panel')
+  const box = document.querySelector('.hermes-sb-setup')
+  if (!box) return null
+  const p = panel.getBoundingClientRect()
+  const b = box.getBoundingClientRect()
+  const buttons = [...box.querySelectorAll('.hermes-sb-setup-btn')].map(n => {
+    const r = n.getBoundingClientRect()
+    return { label: n.textContent.trim(), w: Math.round(r.width), h: Math.round(r.height), y: Math.round(r.y) }
+  })
+  const foot = document.querySelector('.hermes-sb-foot')?.getBoundingClientRect()
+  return {
+    panel: { x: Math.round(p.x), y: Math.round(p.y), w: Math.round(p.width), h: Math.round(p.height) },
+    box: { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) },
+    buttons,
+    footExportX: foot ? Math.round(foot.x) : null,
+    note: document.querySelector('.hermes-sb-setup-note')?.textContent ?? '',
+    noteInset: (() => {
+      const note = document.querySelector('.hermes-sb-setup-note')
+      if (!note) return null
+      return Math.round(note.getBoundingClientRect().left - b.left)
+    })(),
+    noteLines: (() => {
+      const note = document.querySelector('.hermes-sb-setup-note')
+      if (!note) return 0
+      const style = getComputedStyle(note)
+      return Math.round(note.getBoundingClientRect().height / parseFloat(style.lineHeight))
+    })(),
+    gap: (() => {
+      const note = document.querySelector('.hermes-sb-setup-note')
+      if (!note) return null
+      return Math.round(p.bottom - note.getBoundingClientRect().bottom)
+    })(),
+    // A control that paints past the panel edge is the geometry bug this
+    // measurement exists to catch.
+    inside: b.x >= p.x - 1 && b.x + b.width <= p.x + p.width + 1 && b.y + b.height <= p.y + p.height + 1
+  }
+})
+console.log(`setup row: ${JSON.stringify(setupRow)}`)
+if (!setupRow) console.log('!! the setup row is missing from the panel')
+else {
+  if (setupRow.buttons.length !== 2) console.log(`!! expected 2 setup buttons, got ${setupRow.buttons.length}`)
+  if (new Set(setupRow.buttons.map(b => b.h)).size > 1) {
+    console.log(`!! setup buttons disagree on height: ${setupRow.buttons.map(b => b.h)}`)
+  }
+  if (new Set(setupRow.buttons.map(b => b.y)).size > 1) {
+    console.log(`!! setup buttons sit on different baselines: ${setupRow.buttons.map(b => b.y)}`)
+  }
+  if (!setupRow.inside) console.log('!! the setup row overflows the panel')
+  if (!setupRow.note) console.log('!! the setup row has no hint line')
+  // The hint sits on the same left axis as the row's label (2px inset + its own
+  // 4px padding); more than that is a line floating on no axis at all.
+  if (setupRow.noteInset !== null && (setupRow.noteInset < 0 || setupRow.noteInset > 6)) {
+    console.log(`!! the hint line starts ${setupRow.noteInset}px from the row's left anchor`)
+  }
+  if (setupRow.noteLines > 1) console.log(`!! the hint wraps onto ${setupRow.noteLines} lines in a 308px panel`)
+  if (setupRow.gap !== null && setupRow.gap < 2) console.log(`!! the hint has only ${setupRow.gap}px of bottom padding`)
+}
+// The plan is rendered by the component, so open it through the real input.
+const planJson = await page.evaluate(() =>
+  JSON.stringify({
+    format: 'hermes-soundboard-setup',
+    version: 1,
+    settings: { volume: 55, showLabel: true, padsPerRow: 4, oneAtATime: false },
+    sounds: [
+      { name: 'Shared one', kind: 'synth', synth: 'pop', triggers: ['turn.complete'] },
+      { name: 'Shared two', kind: 'synth', synth: 'ding', gain: 140 }
+    ]
+  })
+)
+fs.writeFileSync(path.join(outDir, 'shared.json'), planJson)
+await page.locator('.hermes-sb-panel input[type=file][accept*="json"]').setInputFiles(
+  path.join(outDir, 'shared.json')
+)
+await page.waitForSelector('.hermes-sb-setup-plan', { timeout: 4000 })
+const planBox = await page.evaluate(() => {
+  const panel = document.querySelector('.hermes-sb-panel').getBoundingClientRect()
+  const plan = document.querySelector('.hermes-sb-setup-plan')
+  const p = plan.getBoundingClientRect()
+  const mode = document.querySelector('.hermes-sb-setup-mode')
+  const primary = document.querySelector('.hermes-sb-setup-confirm button[data-primary="true"]')
+  return {
+    plan: { x: Math.round(p.x), y: Math.round(p.y), w: Math.round(p.width), h: Math.round(p.height) },
+    panel: { h: Math.round(panel.height), bottom: Math.round(panel.bottom) },
+    title: document.querySelector('.hermes-sb-setup-plan-title')?.textContent ?? '',
+    modes: document.querySelectorAll('.hermes-sb-setup-mode').length,
+    selected: document.querySelector('.hermes-sb-setup-mode[data-selected="true"]')?.textContent ?? '',
+    primary: primary?.textContent ?? '',
+    modeH: mode ? Math.round(mode.getBoundingClientRect().height) : null,
+    // The checkbox and its label must be adjacent: a gap wide enough to read as
+    // an orphaned control is the failure this measures.
+    checkGap: (() => {
+      const box = document.querySelector('.hermes-sb-setup-check input')
+      const label = document.querySelector('.hermes-sb-setup-check span')
+      if (!box || !label) return null
+      return Math.round(label.getBoundingClientRect().left - box.getBoundingClientRect().right)
+    })(),
+    checkAlign: (() => {
+      const label = document.querySelector('.hermes-sb-setup-check span')
+      return label ? getComputedStyle(label).textAlign : null
+    })(),
+    // The legacy `align` attribute maps to text-align; the SDK stub must not
+    // pass Radix's positioning props through to the DOM sitting under test.
+    panelAlignAttr: document.querySelector('.hermes-sb-panel')?.getAttribute('align') ?? null,
+    // Nothing is applied before the confirm button is pressed: the board must
+    // still be the seven built-ins the page started with.
+    padsBefore: [...document.querySelectorAll('.hermes-sb-pad-name')].map(n => n.textContent).length,
+    inside: p.x >= panel.x - 1 && p.x + p.width <= panel.x + panel.width + 1 && p.bottom <= panel.bottom + 1
+  }
+})
+console.log(`plan block: ${JSON.stringify(planBox)}`)
+if (planBox.modes !== 2) console.log(`!! expected an add/replace choice, got ${planBox.modes} modes`)
+if (!/Add to this board/.test(planBox.selected)) console.log(`!! the safe mode is not preselected (${planBox.selected})`)
+if (!/^Add 2 pads/.test(planBox.primary)) console.log(`!! the confirm button misstates the count (${planBox.primary})`)
+if (!planBox.inside) console.log('!! the plan block overflows the panel')
+if (planBox.checkGap !== null && planBox.checkGap > 8) {
+  console.log(`!! the settings checkbox is ${planBox.checkGap}px from its own label`)
+}
+if (planBox.checkAlign && planBox.checkAlign !== 'start') {
+  console.log(`!! the settings label is ${planBox.checkAlign}-aligned, not flush with its box`)
+}
+if (planBox.panelAlignAttr) {
+  console.log(`!! the popover stub leaked align="${planBox.panelAlignAttr}" into the DOM (text-align)` )
+}
+if (planBox.panel.bottom > 560) console.log(`!! the panel grows past the viewport with a plan open (bottom ${planBox.panel.bottom})`)
+await shot('preview-setup.png')
+
+// Dismissing the plan must change nothing on the board.
+await page.click('.hermes-sb-setup-confirm button:not([data-primary])')
+await page.waitForTimeout(150)
+const dismissed = await page.evaluate(() => ({
+  plan: Boolean(document.querySelector('.hermes-sb-setup-plan')),
+  pads: [...document.querySelectorAll('.hermes-sb-pad-name')].length
+}))
+console.log(`plan dismissed: ${JSON.stringify(dismissed)}`)
+if (dismissed.plan) console.log('!! the plan block stayed open after Cancel')
+if (dismissed.pads !== planBox.padsBefore) console.log('!! cancelling an import changed the board')
+
 // Manage mode.
 await page.click('.hermes-sb-panel button[aria-label="Manage sounds"]')
 await page.waitForTimeout(250)

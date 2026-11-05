@@ -115,10 +115,16 @@ export const PopoverTrigger = ({ children, asChild }) => {
   return asChild ? cloneElement(children, { onClick: toggle }) : createElement('button', { type: 'button', onClick: toggle }, children)
 }
 
-export const PopoverContent = ({ children, ...props }) => {
+// Radix's POSITIONING props must not reach the DOM. The real `PopoverContent`
+// is a portalled element that consumes `side`/`align` and never renders them;
+// this stub spread them through, and `<div align="end">` is an inherited
+// legacy HTML attribute that maps to `text-align` — so every descendant
+// inherited `text-align: end` and the preview screenshots showed a layout the
+// app never produces. Swallow them, keep everything else.
+export const PopoverContent = ({ children, side: _side, align: _align, sideOffset: _offset, ...props }) => {
   const { open } = useContext(PopoverContext)
 
-  return open ? createElement('div', { 'data-popover-content': 'true', ...props }, children) : null
+  return open ? createElement('div', { 'data-popover-content': 'true', tabIndex: -1, ...props }, children) : null
 }
 
 // A visible stand-in for each icon the plugin uses, so the preview shows what

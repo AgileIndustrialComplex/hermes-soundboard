@@ -1171,6 +1171,86 @@ chainCtx.dispose()
 if (chainSoundsBefore !== undefined) storage.set('sounds', chainSoundsBefore)
 if (chainSettingsBefore !== undefined) storage.set('settings', chainSettingsBefore)
 
+// ── several pads on ONE trigger: random choice ──────────────────────────
+// Two pads bound to the same event used to fire together, which made a chord
+// rather than a cue. One is now picked at random.
+storage.set('sounds', JSON.stringify([
+  { id: 'snd-r1', name: 'RandomA', kind: 'synth', synth: 'pop', triggers: ['turn.complete'] },
+  { id: 'snd-r2', name: 'RandomB', kind: 'synth', synth: 'ding', triggers: ['turn.complete'] },
+  { id: 'snd-r3', name: 'Loner', kind: 'synth', synth: 'beep', triggers: ['attention.error'] }
+]))
+storage.set('settings', JSON.stringify({ volume: 80 }))
+const pickCtx = makeCtx()
+plugin.register(pickCtx.ctx)
+const pickMount = mount(pickCtx.contributions.find(c => c.area === 'statusBar.right').render())
+click(pickMount.host.querySelector('button'))
+const pickEngine = pickCtx.ctx.__engine
+
+const litNames = () =>
+  [...pickMount.host.querySelectorAll('.hermes-sb-pad[data-active="true"]')].map(
+    pad => pad.querySelector('.hermes-sb-pad-name')?.textContent
+  )
+
+await emit('message.complete', { status: 'complete' })
+check('exactly one pad fires, not both', () => {
+  const lit = litNames()
+  if (lit.length !== 1) throw new Error(`${lit.length} pads lit: ${JSON.stringify(lit)}`)
+  if (!['RandomA', 'RandomB'].includes(lit[0])) throw new Error(`wrong pad: ${lit[0]}`)
+})
+
+check('a single-bound trigger still fires its one pad', async () => {})
+await emit('error', { message: 'x' })
+check('a trigger with one pad is unaffected', () => {
+  const lit = litNames()
+  if (!lit.includes('Loner')) throw new Error(`lit: ${JSON.stringify(lit)}`)
+})
+
+// Run the trigger many times and confirm both candidates get picked: a random
+// picker that always returned the first pad would pass a single-fire test.
+const seen = new Set()
+for (let i = 0; i < 40; i += 1) {
+  await emit('message.complete', { status: 'complete' })
+  const lit = litNames()
+  if (lit.length !== 1) throw new Error(`run ${i}: ${lit.length} pads lit`)
+  seen.add(lit[0])
+}
+check('both candidates are chosen over many fires', () => {
+  if (seen.size !== 2) throw new Error(`only ${JSON.stringify([...seen])} ever played`)
+})
+
+// Never the same pad twice in a row when there are more than two.
+storage.set('sounds', JSON.stringify([
+  { id: 'snd-m1', name: 'M1', kind: 'synth', synth: 'pop', triggers: ['turn.complete'] },
+  { id: 'snd-m2', name: 'M2', kind: 'synth', synth: 'ding', triggers: ['turn.complete'] },
+  { id: 'snd-m3', name: 'M3', kind: 'synth', synth: 'beep', triggers: ['turn.complete'] }
+]))
+pickMount.unmount()
+pickCtx.dispose()
+const seqCtx = makeCtx()
+plugin.register(seqCtx.ctx)
+const seqMount = mount(seqCtx.contributions.find(c => c.area === 'statusBar.right').render())
+click(seqMount.host.querySelector('button'))
+
+const sequence = []
+for (let i = 0; i < 12; i += 1) {
+  await emit('message.complete', { status: 'complete' })
+  const lit = [...seqMount.host.querySelectorAll('.hermes-sb-pad[data-active="true"]')]
+  sequence.push(lit[0]?.querySelector('.hermes-sb-pad-name')?.textContent)
+}
+check('three candidates never repeat back to back', () => {
+  for (let i = 1; i < sequence.length; i += 1) {
+    if (sequence[i] && sequence[i] === sequence[i - 1]) {
+      throw new Error(`repeated ${sequence[i]} at ${i}: ${JSON.stringify(sequence)}`)
+    }
+  }
+})
+check('the sequence still uses all three', () => {
+  const distinct = new Set(sequence.filter(Boolean))
+  if (distinct.size !== 3) throw new Error(`used ${JSON.stringify([...distinct])}`)
+})
+seqMount.unmount()
+seqCtx.dispose()
+
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 
 const failed = results.filter(row => !row.ok)
