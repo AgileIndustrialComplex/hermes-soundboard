@@ -76,8 +76,10 @@ mode all persist per machine.
 - **Keyboard.** While the panel is focused, `1`–`9` fire the first nine pads and
   `Escape` closes it.
 - **⌘K command.** "Open Soundboard" from the command palette.
-- **Settings → Plugins → Soundboard.** Volume, whether the status-bar chip
-  shows its label, and how many pads fit per row.
+- **Settings → Plugins → Soundboard.** The full manager lives here too, not
+  only in the popover: add a file, import from YouTube, and per pad the preview,
+  trigger picker, rename, reorder (↑/↓), gain, trim and delete — plus the master
+  volume, the label toggle, one-at-a-time and padding preferences.
 
 ## YouTube import
 

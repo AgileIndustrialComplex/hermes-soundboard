@@ -1977,6 +1977,29 @@ const CSS = `
 .hermes-sb-menu-clear:hover{color:var(--ui-text-primary);background-color:var(--chrome-action-hover)}
 /* Per-pad trim: three tiny cells, aligned to the row's 21px control height. */
 /* The trim row takes a full line inside the manage row (flex-wrap is on). */
+/* Settings-page manager: full width, always visible, no popover budget. */
+.hermes-sb-settings-list{display:flex;flex-direction:column;gap:3px;max-height:none}
+.hermes-sb-settings-add{height:24px;padding:0 10px;border-radius:4px;font-size:11px;line-height:14px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-settings-add:hover:not(:disabled){border-color:var(--ui-accent);color:var(--ui-text-primary)}
+.hermes-sb-settings-add[data-on=true]{border-color:var(--ui-accent);color:var(--ui-accent)}
+.hermes-sb-settings-add:disabled{opacity:.45;cursor:default}
+.hermes-sb-settings-yt{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.hermes-sb-settings-yt .hermes-sb-yt-input{flex:1;min-width:180px}
+.hermes-sb-settings-go{height:24px;padding:0 10px;border-radius:4px;font-size:11px;line-height:14px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-settings-go:hover:not(:disabled){border-color:var(--ui-accent);color:var(--ui-text-primary)}
+.hermes-sb-settings-go:disabled{opacity:.45;cursor:default}
+/* A settings page has room, so the name field stops competing with the picker. */
+.hermes-sb-settings-list .hermes-sb-picker{flex:0 0 132px;width:132px}
+.hermes-sb-settings-list .hermes-sb-row .hermes-sb-row-name{min-width:90px}
+/* Reorder arrows are for the settings page. The 271px popover row cannot hold
+   them without squeezing the name field to ~43px, and dragging already reorders
+   there — so they are hidden in the popover and shown where the width exists. */
+.hermes-sb-reorder{display:none;align-items:center;gap:0;flex:0 0 auto;height:21px}
+.hermes-sb-settings-list .hermes-sb-reorder{display:flex}
 .hermes-sb-trim{flex:0 0 100%;display:flex;align-items:center;gap:5px;flex-wrap:wrap;
   margin:3px 0 2px;padding:5px 4px;border-radius:4px;
   background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary)}
@@ -2374,7 +2397,7 @@ function TriggerSelect({ sound, engine }) {
   })
 }
 
-function ManageRow({ sound, engine }) {
+function ManageRow({ sound, engine, index = 0 }) {
   const t = usePluginI18n(ID)
   const [draft, setDraft] = useState(sound.name)
   // Trimming is destructive, so it opens on demand rather than sitting in every
@@ -2476,6 +2499,27 @@ function ManageRow({ sound, engine }) {
             'aria-label': `${t('gainUp')}: ${sound.name}`,
             onClick: () => engine.setGain(sound.id, (sound.gain ?? 100) + 25),
             children: '+'
+          })
+        ]
+      }),
+      jsx('div', {
+        className: 'hermes-sb-reorder',
+        children: [
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-gain-step',
+            'aria-label': `${t('moveUp')}: ${sound.name}`,
+            'data-move': 'up',
+            onClick: () => engine.move(sound.id, index - 1),
+            children: '↑'
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-gain-step',
+            'aria-label': `${t('moveDown')}: ${sound.name}`,
+            'data-move': 'down',
+            onClick: () => engine.move(sound.id, index + 1),
+            children: '↓'
           })
         ]
       }),
@@ -3106,7 +3150,7 @@ function Panel({ engine }) {
         ? jsxs('div', {
             children: [
               sounds.length
-                ? jsx('div', { className: 'hermes-sb-list', children: sounds.map(sound => jsx(ManageRow, { sound, engine }, sound.id)) })
+                ? jsx('div', { className: 'hermes-sb-list', children: sounds.map((sound, i) => jsx(ManageRow, { sound, engine, index: i }, sound.id)) })
                 : jsx('div', { className: 'hermes-sb-empty', children: t('empty') }),
               missing.length
                 ? jsxs('div', {
@@ -3272,6 +3316,199 @@ function Chip({ engine }) {
   })
 }
 
+/** The full pad manager, for the Settings page.
+ *
+ * The panel is 308px wide and shows this only while "manage" is toggled; on a
+ * settings page there is no such constraint and no reason to hide anything, so
+ * this renders the same rows always-open, at full width, with the add controls
+ * beside them. `ManageRow` is shared deliberately: two divergent editors for the
+ * same data would drift the moment either gained a field.
+ */
+function SoundboardManager({ engine }) {
+  const t = usePluginI18n(ID)
+  const sounds = useValue(engine.sounds)
+  const saving = useValue(engine.saving)
+  const fileRef = useRef(null)
+  const [ytOpen, setYtOpen] = useState(false)
+  const [ytUrl, setYtUrl] = useState('')
+  const [ytStart, setYtStart] = useState('')
+  const [ytLength, setYtLength] = useState('')
+  const [ytBusy, setYtBusy] = useState(false)
+  const [ytError, setYtError] = useState('')
+  const ytJob = useValue(engine.ytJob)
+
+  const take = useCallback(
+    async files => {
+      // A FileList handed over from an <input> can be emptied by the caller
+      // resetting it, and `await` gives that a chance — snapshot first.
+      const list = [...(files || [])]
+      for (const file of list.slice(0, 8)) await engine.addFile(file)
+    },
+    [engine]
+  )
+
+  const importFromYoutube = useCallback(async () => {
+    if (!ytUrl.trim() || ytBusy) return
+    setYtBusy(true)
+    setYtError('')
+    try {
+      const sound = await engine.importYoutube(ytUrl.trim(), {
+        start: ytStart.trim() ? Number(ytStart) : 0,
+        length: ytLength.trim() ? Number(ytLength) : null
+      })
+      setYtUrl('')
+      setYtStart('')
+      setYtLength('')
+      setYtOpen(false)
+      engine.notify({ kind: 'info', message: t('ytAdded').replace('{name}', sound.name) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setYtError(message)
+      engine.notify({ kind: 'error', message: `${t('ytFailed')} ${message}` })
+    } finally {
+      setYtBusy(false)
+    }
+  }, [engine, ytUrl, ytStart, ytLength, ytBusy, t])
+
+  const presentSynths = new Set(sounds.filter(sound => sound.kind === 'synth').map(sound => sound.synth))
+  const missing = SYNTHS.filter(synth => !presentSynths.has(synth.id))
+
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: '10px' },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' },
+        children: [
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-settings-add',
+            disabled: saving || sounds.length >= MAX_SOUNDS,
+            onClick: () => fileRef.current?.click(),
+            children: saving ? t('saving') : t('addSound')
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-settings-add',
+            'data-on': ytOpen,
+            'aria-expanded': ytOpen,
+            onClick: () => setYtOpen(value => !value),
+            children: t('ytOpen')
+          }),
+          jsx('span', {
+            style: { fontSize: '11px', color: 'var(--ui-text-tertiary)' },
+            children: t('stats', sounds.length, sounds.filter(sound => sound.kind === 'file').length)
+          })
+        ]
+      }),
+
+      jsx('input', {
+        ref: fileRef,
+        type: 'file',
+        accept: 'audio/*',
+        multiple: true,
+        style: { display: 'none' },
+        onChange: event => {
+          const files = [...event.target.files]
+          event.target.value = ''
+          void take(files)
+        }
+      }),
+
+      ytOpen
+        ? jsxs('div', {
+            className: 'hermes-sb-settings-yt',
+            children: [
+              jsx('input', {
+                type: 'text',
+                className: 'hermes-sb-yt-input',
+                placeholder: t('ytPlaceholder'),
+                value: ytUrl,
+                spellCheck: false,
+                disabled: ytBusy,
+                'aria-label': t('ytPlaceholder'),
+                onChange: event => setYtUrl(event.target.value),
+                onKeyDown: event => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    void importFromYoutube()
+                  }
+                }
+              }),
+              jsx('input', {
+                type: 'number', min: '0', step: '0.1', placeholder: t('ytStart'),
+                className: 'hermes-sb-yt-trim-input', value: ytStart, disabled: ytBusy,
+                'aria-label': t('ytStart'), onChange: event => setYtStart(event.target.value)
+              }),
+              jsx('input', {
+                type: 'number', min: '0.2', step: '0.1', placeholder: t('ytLength'),
+                className: 'hermes-sb-yt-trim-input', value: ytLength, disabled: ytBusy,
+                'aria-label': t('ytLength'), onChange: event => setYtLength(event.target.value)
+              }),
+              jsx('button', {
+                type: 'button',
+                className: 'hermes-sb-settings-go',
+                disabled: ytBusy || !ytUrl.trim(),
+                onClick: () => void importFromYoutube(),
+                children: ytBusy ? t('ytWorking') : t('ytImport')
+              })
+            ]
+          })
+        : null,
+
+      ytBusy
+        ? jsx('div', {
+            className: 'hermes-sb-yt-progress',
+            role: 'progressbar',
+            'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': ytJob?.percent ?? 0,
+            children: [
+              jsx('div', { className: 'hermes-sb-yt-bar', children: jsx('div', {
+                className: 'hermes-sb-yt-bar-fill',
+                style: { width: `${Math.max(4, ytJob?.percent ?? 0)}%` }
+              }) }),
+              jsx('span', {
+                className: 'hermes-sb-yt-pct',
+                children: ytJob?.percent ? `${ytJob.percent}%` : t('ytWorking')
+              })
+            ]
+          })
+        : null,
+      ytError ? jsx('div', { className: 'hermes-sb-yt-note', 'data-error': 'true', children: ytError }) : null,
+
+      sounds.length
+        ? jsx('div', { className: 'hermes-sb-settings-list', children: sounds.map((sound, i) => jsx(ManageRow, { sound, engine, index: i }, sound.id)) })
+        : jsx('div', { className: 'hermes-sb-empty', children: t('empty') }),
+
+      missing.length
+        ? jsxs('div', {
+            children: [
+              jsx('div', { className: 'hermes-sb-section', children: t('builtins') }),
+              jsx('div', {
+                className: 'hermes-sb-presets',
+                children: missing.map(synth =>
+                  jsx('button', {
+                    type: 'button',
+                    className: 'hermes-sb-preset',
+                    disabled: sounds.length >= MAX_SOUNDS,
+                    onClick: () => engine.addPreset(synth.id),
+                    children: synth.name
+                  }, synth.id)
+                )
+              })
+            ]
+          })
+        : null,
+      // Drag to reorder is a pointer affordance; on a settings page a keyboard
+      // path matters more, so each row also gets move buttons.
+      sounds.length > 1
+        ? jsx('div', {
+            style: { fontSize: '11px', color: 'var(--ui-text-tertiary)' },
+            children: t('reorderHint')
+          })
+        : null
+    ]
+  })
+}
+
 function SoundboardSettings({ engine }) {
   const t = usePluginI18n(ID)
   const settings = useValue(engine.settings)
@@ -3331,6 +3568,25 @@ function SoundboardSettings({ engine }) {
           })
         ]
       }),
+      // The pads themselves, managed here as well as in the popover. A settings
+      // page is where people look for "manage my sounds"; hiding it behind a
+      // toggle inside a 308px popover was the only way before.
+      jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: '8px' },
+        children: [
+          jsx('div', {
+            style: {
+              fontSize: '11px',
+              fontWeight: 600,
+              letterSpacing: '.06em',
+              textTransform: 'uppercase',
+              color: 'var(--ui-text-tertiary)'
+            },
+            children: t('manage')
+          }),
+          jsx(SoundboardManager, { engine })
+        ]
+      }),
       jsxs('div', {
         style: { fontSize: '12px', color: 'var(--ui-text-tertiary)' },
         children: [
@@ -3387,6 +3643,9 @@ const LOCALES = {
     trimFailed: 'The trim did not complete.',
     trimNeedsWindow: 'Give a start or a length — otherwise nothing would change.',
     trimOnlyFiles: 'Only imported or uploaded clips can be trimmed.',
+    moveUp: 'Move up',
+    moveDown: 'Move down',
+    reorderHint: 'Order sets which pad each of the 1-9 keys fires.',
     ytWorking: 'Converting…',
     ytAdded: 'Added “{name}”.',
     ytBadUrl: 'That is not a YouTube link.',
@@ -3487,6 +3746,9 @@ const LOCALES = {
     trimFailed: 'Przycinanie nie powiodło się.',
     trimNeedsWindow: 'Podaj początek lub długość — inaczej nic się nie zmieni.',
     trimOnlyFiles: 'Przycinać można tylko klipy zaimportowane lub wgrane.',
+    moveUp: 'W górę',
+    moveDown: 'W dół',
+    reorderHint: 'Kolejność decyduje, którą podkładkę uruchamia każdy z klawiszy 1-9.',
     ytWorking: 'Pobieranie i konwersja… to może chwilę potrwać.',
     ytAdded: 'Dodano „{name}”.',
     ytBadUrl: 'To nie jest link do YouTube.',

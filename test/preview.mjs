@@ -897,9 +897,9 @@ const gainState = await page.evaluate(() => {
   return {
     rows: rows.length,
     gains: [...document.querySelectorAll('.hermes-sb-gain-value')].map(n => n.textContent),
-    steps: document.querySelectorAll('.hermes-sb-gain-step').length,
+    steps: document.querySelectorAll('.hermes-sb-gain .hermes-sb-gain-step').length,
     // Consistent control height is what makes a row look tidy.
-    heights: [...document.querySelectorAll('.hermes-sb-gain, .hermes-sb-picker')].map(
+    heights: [...document.querySelectorAll('.hermes-sb-row .hermes-sb-gain, .hermes-sb-row .hermes-sb-picker')].map(
       n => Math.round(n.getBoundingClientRect().height)
     )
   }
@@ -921,7 +921,9 @@ if (!(await page.$('.hermes-sb-row'))) {
   await page.waitForTimeout(250)
 }
 const widths = await page.evaluate(() => {
-  const row = document.querySelector('.hermes-sb-row')
+  // Exclude the settings-page rows, which are deliberately wider.
+  const row = [...document.querySelectorAll('.hermes-sb-row')]
+    .find(r => !r.closest('.hermes-sb-settings-list'))
   if (!row) return null
   const w = sel => {
     const n = row.querySelector(sel)
@@ -939,7 +941,7 @@ const widths = await page.evaluate(() => {
 console.log(`row widths: ${JSON.stringify(widths)}`)
 // A name field narrower than its own text is the bug this measurement exists to
 // catch: at 31px every label clipped mid-word.
-if (widths && widths.name < 60) console.log(`!! the name field is only ${widths.name}px — names will clip`)
+if (widths && widths.name < 60) console.log(`!! the popover name field is only ${widths.name}px — names will clip`)
 const nameFit = await page.evaluate(() => {
   const inputs = [...document.querySelectorAll('.hermes-sb-row-name')]
   return {
@@ -1010,6 +1012,43 @@ if (!oneAtATime.found) console.log('!! the one-at-a-time toggle is missing from 
 await page.evaluate(() => window.__mountSettings())
 await page.waitForTimeout(300)
 await shot('preview-settings.png')
+
+// ── the settings page must manage sounds, not just preferences ──────────
+const settingsManager = await page.evaluate(() => {
+  const rows = [...document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-row')]
+  const list = document.querySelector('.hermes-sb-settings-list')
+  const nameWidths = [...document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-row-name')]
+    .map(n => Math.round(n.getBoundingClientRect().width))
+  return {
+    rows: rows.length,
+    hasAdd: Boolean(document.querySelector('.hermes-sb-settings-add')),
+    hasYt: Boolean([...document.querySelectorAll('.hermes-sb-settings-add')]
+      .some(b => /youtube/i.test(b.textContent))),
+    reorderButtons: document.querySelectorAll('.hermes-sb-reorder button').length,
+    trims: document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-rowbtn[data-trim]').length,
+    minNameWidth: nameWidths.length ? Math.min(...nameWidths) : 0,
+    // Full width on a settings page: no 308px popover budget.
+    listWidth: list ? Math.round(list.getBoundingClientRect().width) : 0
+  }
+})
+console.log(`settings manager: ${JSON.stringify(settingsManager)}`)
+if (!settingsManager.rows) console.log('!! the settings page lists no sounds')
+if (!settingsManager.hasAdd) console.log('!! no add-file control on the settings page')
+if (!settingsManager.hasYt) console.log('!! no YouTube import on the settings page')
+if (settingsManager.reorderButtons < settingsManager.rows * 2) console.log('!! reorder buttons missing')
+if (settingsManager.listWidth < 320) console.log(`!! the manager is still popover-width (${settingsManager.listWidth}px)`)
+
+// Reordering from settings must persist, since order drives the 1-9 keys.
+const beforeOrder = await page.evaluate(() =>
+  [...document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-row-name')].map(n => n.value))
+await page.click('.hermes-sb-settings-list .hermes-sb-row [data-move="down"]')
+await page.waitForTimeout(250)
+const afterOrder = await page.evaluate(() =>
+  [...document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-row-name')].map(n => n.value))
+console.log(`reorder: ${JSON.stringify(beforeOrder.slice(0, 3))} -> ${JSON.stringify(afterOrder.slice(0, 3))}`)
+if (JSON.stringify(beforeOrder) === JSON.stringify(afterOrder)) console.log('!! the move button did nothing')
+else if (beforeOrder[0] !== afterOrder[1]) console.log('!! the moved pad did not land in the next slot')
+await shot('preview-settings-manage.png')
 
 await browser.close()
 server.close()
