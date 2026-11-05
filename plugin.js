@@ -2213,26 +2213,36 @@ const CSS = `
 .hermes-sb-profile-caret{flex:0 0 auto;font-size:8px;color:var(--ui-text-tertiary)}
 /* In flow, not absolutely positioned — the same reason as the trigger picker:
    a 308px popover with a backdrop filter breaks fixed positioning. */
-.hermes-sb-profile-menu{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:4px;width:176px;
+/* OVERLAY, not in flow. In flow the menu grew the header by ~100px and shoved
+   the pad grid down every time it opened — the board jumped. The earlier
+   in-flow decision was forced by the manage list's overflow-y:auto clipping an
+   absolute child; the header has no such clipping ancestor, so absolute works
+   here and the board stays put. */
+.hermes-sb-profile-menu{position:absolute;top:100%;left:0;z-index:40;
+  display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:6px;width:184px;
   border-radius:5px;background-color:var(--ui-bg-secondary);border:1px solid var(--ui-stroke-secondary)}
 .hermes-sb-profile-item{display:flex;align-items:center;gap:6px;width:100%;height:22px;padding:0 5px;
-  border-radius:4px;font-size:11px;text-align:left;color:var(--ui-text-primary);background:transparent}
+  border-radius:4px;font-size:11px;text-align:left;color:var(--ui-text-secondary);background:transparent}
 .hermes-sb-profile-item:hover{background-color:var(--chrome-action-hover)}
-.hermes-sb-profile-item[aria-selected=true]{color:var(--ui-accent)}
+.hermes-sb-profile-item[aria-selected=true]{color:var(--ui-accent);
+  background-color:color-mix(in srgb, var(--ui-accent) 12%, transparent)}
+.hermes-sb-profile-item[aria-selected=true] .hermes-sb-profile-item-meta{color:var(--ui-text-secondary)}
 .hermes-sb-profile-item-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hermes-sb-profile-item-meta{flex:0 0 auto;font-size:10px;color:var(--ui-text-tertiary)}
-.hermes-sb-profile-tick{flex:0 0 auto;font-size:10px;color:var(--ui-accent)}
+.hermes-sb-profile-item-meta{flex:0 0 auto;font-size:10px;color:var(--ui-text-tertiary);margin-left:auto}
+.hermes-sb-profile-item[aria-selected=false] .hermes-sb-profile-tick{visibility:hidden}
+.hermes-sb-profile-tick{flex:0 0 10px;width:10px;text-align:center;font-size:10px;color:var(--ui-accent)}
 .hermes-sb-profile-empty{padding:4px;font-size:11px;color:var(--ui-text-tertiary)}
-.hermes-sb-profile-save{display:flex;align-items:center;gap:4px;padding-top:4px;margin-top:2px;
+.hermes-sb-profile-save{display:flex;align-items:center;gap:5px;padding-top:6px;margin-top:4px;
   border-top:1px solid var(--ui-stroke-secondary)}
-.hermes-sb-profile-input{flex:1;min-width:0;height:22px;padding:0 5px;border-radius:4px;font-size:11px;
+.hermes-sb-profile-input{flex:1;min-width:0;height:24px;padding:0 5px;border-radius:4px;font-size:11px;
   color:var(--ui-text-primary);background-color:var(--ui-bg-primary);
   border:1px solid var(--ui-stroke-secondary)}
 .hermes-sb-profile-input::placeholder{color:var(--ui-text-tertiary)}
-.hermes-sb-profile-savebtn{flex:0 0 auto;height:22px;padding:0 7px;border-radius:4px;font-size:10px;
-  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
-  border:1px solid var(--ui-stroke-secondary)}
-.hermes-sb-profile-savebtn:hover{color:var(--ui-text-primary);border-color:var(--ui-accent)}
+.hermes-sb-profile-savebtn{flex:0 0 auto;height:24px;padding:0 9px;border-radius:4px;
+  display:inline-flex;align-items:center;justify-content:center;font-size:10px;line-height:1;white-space:nowrap;
+  color:var(--ui-accent);background-color:color-mix(in srgb, var(--ui-accent) 14%, transparent);
+  border:1px solid color-mix(in srgb, var(--ui-accent) 55%, transparent)}
+.hermes-sb-profile-savebtn:hover{background-color:color-mix(in srgb, var(--ui-accent) 24%, transparent)}
 /* Settings rows: full width, so the action leads and the count trails. */
 .hermes-sb-profile-rows{display:flex;flex-direction:column;gap:3px}
 .hermes-sb-profile-row{display:flex;align-items:center;gap:5px;height:24px}
@@ -3648,9 +3658,11 @@ function ProfilePicker({ engine }) {
                           className: 'hermes-sb-profile-item-meta',
                           children: t('padCount', profile.sounds.length)
                         }),
-                        profile.id === activeId
-                          ? jsx('span', { className: 'hermes-sb-profile-tick', 'aria-hidden': 'true', children: '✓' })
-                          : null
+                        jsx('span', {
+                          className: 'hermes-sb-profile-tick',
+                          'aria-hidden': profile.id === activeId ? 'false' : 'true',
+                          children: profile.id === activeId ? '✓' : ''
+                        })
                       ]
                     }, profile.id)
                   )
@@ -3676,8 +3688,10 @@ function ProfilePicker({ engine }) {
                   jsx('button', {
                     type: 'button',
                     className: 'hermes-sb-profile-savebtn',
+                    'aria-label': active ? t('saveToProfile') : t('saveProfile'),
+                    title: active ? t('saveToProfile') : t('saveProfile'),
                     onClick: save,
-                    children: t('saveProfile')
+                    children: t('saveShort')
                   })
                 ]
               })
@@ -4136,6 +4150,7 @@ const LOCALES = {
     profiles: 'Profiles',
     profileName: 'New profile name',
     saveProfile: 'Save board',
+    saveShort: 'Save',
     saveToProfile: 'Save to profile',
     saveOver: 'Name for a new profile',
     noProfile: 'Unsaved',
@@ -4257,6 +4272,7 @@ const LOCALES = {
     profiles: 'Profile',
     profileName: 'Nazwa nowego profilu',
     saveProfile: 'Zapisz planszę',
+    saveShort: 'Zapisz',
     saveToProfile: 'Zapisz w profilu',
     saveOver: 'Nazwa nowego profilu',
     noProfile: 'Niezapisana',

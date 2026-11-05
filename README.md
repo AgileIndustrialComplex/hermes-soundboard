@@ -233,7 +233,9 @@ only mean anything together — a "podcast" board is as much about the volume an
 one-at-a-time as about which clips are on it.
 
 Switching lives in the popover header, because that is the on-the-go surface: you
-change board mid-conversation, not mid-settings. Settings lists the same profiles
+change board mid-conversation, not mid-settings. The menu is an overlay, anchored
+to its trigger — in flow it grew the header by ~100px and shoved the pad grid
+down every time it opened, so the board jumped under your finger. Settings lists the same profiles
 with rename and delete, which need a text field per row.
 
 Two behaviours worth knowing:

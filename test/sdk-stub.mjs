@@ -140,7 +140,12 @@ const GLYPH = {
   VolumeX: '🔇',
   AudioLines: '≋',
   Pause: '❙❙',
-  X: '✕'
+  X: '✕',
+  Save: '💾',
+  Clock: '⏱',
+  Download: '↓',
+  Upload: '↑',
+  Link: '🔗'
 }
 
 const icon = name => {

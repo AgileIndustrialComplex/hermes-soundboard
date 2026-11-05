@@ -1122,11 +1122,39 @@ if (!boardAfterSwitch.length) console.log('!! switching left the live board empt
 // The popover switcher must offer both profiles.
 await page.click('.hermes-sb-profile-btn')
 await page.waitForTimeout(250)
+const headBefore = await page.evaluate(() => {
+  const h = document.querySelector('.hermes-sb-head')
+  const g = document.querySelector('.hermes-sb-grid')
+  return { head: Math.round(h.getBoundingClientRect().height), padTop: g ? Math.round(g.getBoundingClientRect().top) : null }
+})
 const profileMenu = await page.evaluate(() => {
   const el = document.querySelector('.hermes-sb-profile-menu')
   if (!el) return { open: false }
   const box = el.getBoundingClientRect()
   const boxOfMenu = box
+  // Everything the screenshot complained about, measured rather than eyeballed.
+  const panel = document.querySelector('.hermes-sb-panel')
+  const panelBox = panel ? panel.getBoundingClientRect() : null
+  const btn = document.querySelector('.hermes-sb-profile-btn').getBoundingClientRect()
+  const head = document.querySelector('.hermes-sb-head').getBoundingClientRect()
+  const item = el.querySelector('.hermes-sb-profile-item')
+  const itemBox = item.getBoundingClientRect()
+  const nameEl = item.querySelector('.hermes-sb-profile-item-name')
+  const metaEl = item.querySelector('.hermes-sb-profile-item-meta')
+  const tick = item.querySelector('.hermes-sb-profile-tick')
+  const metaBox = metaEl.getBoundingClientRect()
+  const tickBox = tick ? tick.getBoundingClientRect() : null
+  const input = el.querySelector('.hermes-sb-profile-input')
+  const saveBtn = el.querySelector('.hermes-sb-profile-savebtn')
+  // Does the placeholder fit? Compare its rendered width to the field's.
+  const probe = document.createElement('span')
+  probe.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;font:' + getComputedStyle(input).font
+  probe.textContent = input.placeholder
+  document.body.append(probe)
+  const placeholderWidth = probe.getBoundingClientRect().width
+  probe.remove()
+  const selectOverhang = box.right - btn.right
+  const headGrew = Math.round(head.height)
   return {
     open: true,
     items: [...el.querySelectorAll('.hermes-sb-profile-item')].map(i => i.textContent.trim()),
@@ -1135,10 +1163,35 @@ const profileMenu = await page.evaluate(() => {
     withinViewport: box.left >= 0 && box.top >= 0 && box.right <= window.innerWidth,
     // The save field must be usable AND stay inside the menu: a field wider
     // than its container means the footer has burst out of the popup.
-    saveFieldWidth: Math.round(document.querySelector('.hermes-sb-profile-input').getBoundingClientRect().width),
+    saveFieldWidth: Math.round(input.getBoundingClientRect().width),
+    btnWidth: Math.round(btn.width),
+    btnRight: Math.round(btn.right),
+    menuLeft: Math.round(box.left),
+    menuRight: Math.round(box.right),
+    panelRight: panelBox ? Math.round(panelBox.right) : null,
+    overhangRight: Math.round(selectOverhang),
+    labelIndentDelta: Math.round(nameEl.getBoundingClientRect().left - btn.left),
+    metaToTickGap: tickBox ? Math.round(tickBox.left - metaBox.right) : null,
+    countRightEdges: [...el.querySelectorAll('.hermes-sb-profile-item-meta')]
+      .map(n => Math.round(n.getBoundingClientRect().right)),
+    // Unrounded: a rounded 24 vs 24 can hide a 0.5px real mismatch.
+    saveRowHeights: [input, saveBtn].map(n => +n.getBoundingClientRect().height.toFixed(2)),
+    saveRowTops: [input, saveBtn].map(n => +n.getBoundingClientRect().top.toFixed(2)),
+    saveRowBottoms: [input, saveBtn].map(n => +n.getBoundingClientRect().bottom.toFixed(2)),
+    itemInnerWidth: Math.round(itemBox.width),
+    headHeight: headGrew,
+    panelBottom: panelBox ? Math.round(panelBox.bottom) : null,
+    menuOverPanelBottom: panelBox ? Math.round(box.bottom - panelBox.bottom) : null,
+    placeholderWidth: Math.round(placeholderWidth),
+    placeholderFits: placeholderWidth <= input.getBoundingClientRect().width - 12,
+    padTop: (() => {
+      const g = document.querySelector('.hermes-sb-grid')
+      return g ? Math.round(g.getBoundingClientRect().top) : null
+    })(),
     footerFits: (() => {
-      const field = document.querySelector('.hermes-sb-profile-input').getBoundingClientRect()
-      const btn = document.querySelector('.hermes-sb-profile-savebtn').getBoundingClientRect()
+      const scoped = document.querySelector('.hermes-sb-profile-menu')
+      const field = scoped.querySelector('.hermes-sb-profile-input').getBoundingClientRect()
+      const btn = scoped.querySelector('.hermes-sb-profile-savebtn').getBoundingClientRect()
       const menuBox = boxOfMenu
       return field.right <= menuBox.right + 1 && btn.right <= menuBox.right + 1
     })(),
@@ -1150,7 +1203,41 @@ if (!profileMenu.open) console.log('!! the profile menu did not open from the he
 if (profileMenu.open && !profileMenu.withinViewport) console.log('!! the profile menu rendered outside the window')
 if (profileMenu.open && profileMenu.saveFieldWidth < 110) console.log(`!! the profile name field is only ${profileMenu.saveFieldWidth}px — its placeholder clips`)
 if (profileMenu.open && !profileMenu.footerFits) console.log('!! the save row overflows the profile menu')
+if (profileMenu.open && Math.abs(profileMenu.menuLeft - profileMenu.btnRight + profileMenu.btnWidth) > 3) {
+  console.log(`!! the menu is not left-aligned to its trigger (menu ${profileMenu.menuLeft}, button left ${profileMenu.btnRight - profileMenu.btnWidth})`)
+}
+if (profileMenu.open && profileMenu.labelIndentDelta > 12) {
+  console.log(`!! the menu label is indented ${profileMenu.labelIndentDelta}px from the trigger's label`)
+}
+if (profileMenu.open && profileMenu.metaToTickGap !== null && profileMenu.metaToTickGap < 2) {
+  console.log(`!! the tick overlaps the pad count (gap ${profileMenu.metaToTickGap}px)`)
+}
+if (profileMenu.open && new Set(profileMenu.countRightEdges).size > 1) {
+  console.log(`!! the pad counts do not form a column: right edges ${JSON.stringify(profileMenu.countRightEdges)}`)
+}
+if (profileMenu.open && new Set(profileMenu.saveRowHeights).size > 1) {
+  console.log(`!! the save field and button are different heights: ${JSON.stringify(profileMenu.saveRowHeights)}`)
+}
+if (profileMenu.open && !profileMenu.placeholderFits) {
+  console.log(`!! the placeholder needs ${profileMenu.placeholderWidth}px in a ${profileMenu.saveFieldWidth}px field`)
+}
+if (profileMenu.open && profileMenu.panelRight && profileMenu.menuRight > profileMenu.panelRight) {
+  console.log(`!! the menu hangs past the panel's right edge (${profileMenu.menuRight} > ${profileMenu.panelRight})`)
+}
+const headAfter = await page.evaluate(() => {
+  const h = document.querySelector('.hermes-sb-head')
+  const g = document.querySelector('.hermes-sb-grid')
+  return { head: Math.round(h.getBoundingClientRect().height), padTop: g ? Math.round(g.getBoundingClientRect().top) : null }
+})
+console.log(`header on open: ${JSON.stringify(headBefore)} -> ${JSON.stringify(headAfter)}`)
+if (headAfter.head !== headBefore.head) console.log(`!! the header grew ${headAfter.head - headBefore.head}px when the menu opened — the board jumped`)
+if (headBefore.padTop !== null && headAfter.padTop !== headBefore.padTop) console.log('!! the pads moved when the menu opened')
 await shot('preview-profiles.png')
+// Element screenshot: unambiguous, no coordinate guessing about what is on top.
+const panelEl = await page.$('.hermes-sb-panel')
+if (panelEl) await panelEl.screenshot({ path: path.join(outDir, 'preview-profiles-panel.png') })
+const menuEl = await page.$('.hermes-sb-profile-menu')
+if (menuEl) await menuEl.screenshot({ path: path.join(outDir, 'preview-profiles-menu.png') })
 
 await browser.close()
 server.close()
