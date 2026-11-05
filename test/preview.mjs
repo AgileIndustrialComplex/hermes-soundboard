@@ -413,6 +413,15 @@ const sliderBox = await boxOf('.hermes-sb-foot input[type=range]')
 console.log('\nchip  ', JSON.stringify(chipBox))
 console.log('panel ', JSON.stringify(panelBox))
 console.log('title ', JSON.stringify(titleBox))
+const headBox = await boxOf('.hermes-sb-head')
+console.log('head  ', JSON.stringify(headBox), 'panel x', panelBox.x)
+const titleCS = await page.evaluate(() => {
+  const el = document.querySelector('.hermes-sb-head-title')
+  const cs = getComputedStyle(el)
+  const head = getComputedStyle(document.querySelector('.hermes-sb-head'))
+  return { pl: cs.paddingLeft, ml: cs.marginLeft, headPl: head.paddingLeft, headGap: head.columnGap }
+})
+console.log('title cs', JSON.stringify(titleCS))
 console.log('grid  ', JSON.stringify(gridBox))
 console.log('foot  ', JSON.stringify(footBox))
 console.log('slider', JSON.stringify(sliderBox))
@@ -1049,6 +1058,99 @@ console.log(`reorder: ${JSON.stringify(beforeOrder.slice(0, 3))} -> ${JSON.strin
 if (JSON.stringify(beforeOrder) === JSON.stringify(afterOrder)) console.log('!! the move button did nothing')
 else if (beforeOrder[0] !== afterOrder[1]) console.log('!! the moved pad did not land in the next slot')
 await shot('preview-settings-manage.png')
+
+// ── profiles: save, switch on the go, and the settings list ─────────────
+const profileShape = await page.evaluate(() => {
+  const btn = document.querySelector('.hermes-sb-profile-btn')
+  const settingsRows = document.querySelectorAll('.hermes-sb-profile-row')
+  const save = document.querySelector('[data-save-profile]')
+  if (!btn) return { hasSwitcher: false }
+  const box = btn.getBoundingClientRect()
+  const head = document.querySelector('.hermes-sb-head').getBoundingClientRect()
+  return {
+    hasSwitcher: true,
+    label: btn.textContent.trim(),
+    inHeader: box.top >= head.top - 1 && box.bottom <= head.bottom + 1,
+    btnHeight: Math.round(box.height),
+    settingsRows: settingsRows.length,
+    hasSave: Boolean(save)
+  }
+})
+console.log(`profile switcher: ${JSON.stringify(profileShape)}`)
+if (!profileShape.hasSwitcher) console.log('!! no profile switcher in the popover header')
+if (profileShape.hasSwitcher && !profileShape.inHeader) console.log('!! the switcher is not inside the header row')
+if (!profileShape.hasSave) console.log('!! settings has no save-board control')
+
+// Save a board from settings, then switch to it from the popover.
+const panelNamesBefore = await page.evaluate(() =>
+  [...document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-row-name')].map(n => n.value))
+await page.fill('[aria-label="New profile name"]', 'Podcast')
+await page.click('[data-save-profile]')
+await page.waitForTimeout(300)
+const saved = await page.evaluate(() =>
+  [...document.querySelectorAll('.hermes-sb-profile-row')].map(r => ({
+    name: r.querySelector('.hermes-sb-profile-rename')?.value,
+    active: r.dataset.active === 'true'
+  })))
+console.log(`profiles after save: ${JSON.stringify(saved)}`)
+if (!saved.length) console.log('!! saving did not create a profile row')
+if (saved.length && !saved.some(p => p.active)) console.log('!! the saved profile is not marked active')
+
+// Make a second profile, then switch away from it — the active row's button is
+// disabled on purpose, so the click has to target an inactive one.
+// We are on the settings page, so the edit happens there: reordering is a real
+// change to the board and makes the live set differ from the saved profile.
+await page.click('.hermes-sb-settings-list .hermes-sb-row [data-move="down"]')
+await page.waitForTimeout(200)
+await page.fill('[aria-label="New profile name"]', 'Gaming')
+await page.click('[data-save-profile]')
+await page.waitForTimeout(250)
+const twoProfiles = await page.evaluate(() =>
+  document.querySelectorAll('.hermes-sb-profile-row').length)
+console.log(`profiles saved: ${twoProfiles}`)
+if (twoProfiles < 2) console.log('!! saving under a new name did not add a profile')
+await page.click('.hermes-sb-profile-row:not([data-active="true"]) .hermes-sb-profile-use')
+await page.waitForTimeout(250)
+await shot('preview-settings-profiles.png')
+const boardAfterSwitch = await page.evaluate(() => {
+  // Settings lists the live board, which is what the switch changed.
+  return [...document.querySelectorAll('.hermes-sb-settings-list .hermes-sb-row-name')].map(n => n.value)
+})
+console.log(`board after switching: ${JSON.stringify(boardAfterSwitch.slice(0, 3))}`)
+if (!boardAfterSwitch.length) console.log('!! switching left the live board empty')
+
+// The popover switcher must offer both profiles.
+await page.click('.hermes-sb-profile-btn')
+await page.waitForTimeout(250)
+const profileMenu = await page.evaluate(() => {
+  const el = document.querySelector('.hermes-sb-profile-menu')
+  if (!el) return { open: false }
+  const box = el.getBoundingClientRect()
+  const boxOfMenu = box
+  return {
+    open: true,
+    items: [...el.querySelectorAll('.hermes-sb-profile-item')].map(i => i.textContent.trim()),
+    width: Math.round(box.width),
+    // In flow, so it must sit inside the popover rather than off-screen.
+    withinViewport: box.left >= 0 && box.top >= 0 && box.right <= window.innerWidth,
+    // The save field must be usable AND stay inside the menu: a field wider
+    // than its container means the footer has burst out of the popup.
+    saveFieldWidth: Math.round(document.querySelector('.hermes-sb-profile-input').getBoundingClientRect().width),
+    footerFits: (() => {
+      const field = document.querySelector('.hermes-sb-profile-input').getBoundingClientRect()
+      const btn = document.querySelector('.hermes-sb-profile-savebtn').getBoundingClientRect()
+      const menuBox = boxOfMenu
+      return field.right <= menuBox.right + 1 && btn.right <= menuBox.right + 1
+    })(),
+    menuOverflows: box.right > document.querySelector('.hermes-sb-panel, [data-hermes-soundboard]')?.getBoundingClientRect().right ?? window.innerWidth
+  }
+})
+console.log(`profile menu: ${JSON.stringify(profileMenu)}`)
+if (!profileMenu.open) console.log('!! the profile menu did not open from the header')
+if (profileMenu.open && !profileMenu.withinViewport) console.log('!! the profile menu rendered outside the window')
+if (profileMenu.open && profileMenu.saveFieldWidth < 110) console.log(`!! the profile name field is only ${profileMenu.saveFieldWidth}px — its placeholder clips`)
+if (profileMenu.open && !profileMenu.footerFits) console.log('!! the save row overflows the profile menu')
+await shot('preview-profiles.png')
 
 await browser.close()
 server.close()

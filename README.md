@@ -51,6 +51,9 @@ mode all persist per machine.
   context compaction, a heartbeat, a wake phrase, or affection detected in your
   message. Bound pads carry a dot in the grid; the panel footer names the last
   trigger that actually fired. See [Triggers](#triggers).
+- **Profiles.** Save the whole board — pads, volume, one-at-a-time — under a
+  name, then switch between saved boards from the popover header (change board
+  mid-conversation) or from Settings, where you can also rename and delete them.
 - **One at a time.** An optional *Play one sound at a time* mode stops whatever
   is still sounding before the next pad starts, so clips never stack — useful if
   you fire pads quickly and the overlap turns to mush. Applies to clicks and to
@@ -223,6 +226,28 @@ the WebAudio context can be suspended by the browser's autoplay policy. Every
 trigger attempts a resume; if the platform refuses, the pad still lights up, so
 the cue is never silently lost.
 
+## Profiles
+
+A profile is a snapshot of the **pads plus the global settings**, because those
+only mean anything together — a "podcast" board is as much about the volume and
+one-at-a-time as about which clips are on it.
+
+Switching lives in the popover header, because that is the on-the-go surface: you
+change board mid-conversation, not mid-settings. Settings lists the same profiles
+with rename and delete, which need a text field per row.
+
+Two behaviours worth knowing:
+
+- **Save in place vs. save as new.** Saving under the active profile's name
+  overwrites it — the common case is "I tweaked my board". Typing a *different*
+  name creates a second profile instead of renaming the open one.
+- **Switching away from an unsaved board keeps it**, saved as "Previous board"
+  the first time. Switching is otherwise a silent way to lose work.
+
+Clips are **not** copied into profiles. They stay in the data folder keyed by
+sound id, so two profiles can share one clip — which is why deleting a pad only
+trashes its blob when no profile still references it.
+
 ## Sharing a setup
 
 `Export` at the foot of the panel (and on the settings page) collects the whole
@@ -335,7 +360,7 @@ loader resolves at runtime are `@hermes/plugin-sdk` and `react/jsx-runtime`:
 | Bottom bar | `ctx.register({ area: STATUSBAR_AREAS.right })` + `Popover` |
 | Command palette | `ctx.register({ area: PALETTE_AREA })` |
 | Settings page | `ctx.registerSettingsPage({...})` |
-| Persistence | `ctx.storage` (sounds + settings) |
+| Persistence | `ctx.storage` (sounds + settings + profiles + activeProfile) |
 | Clips | `ctx.files.writeText('data', '<id>.b64', base64)` / `readText` / `trash` |
 | Sound | WebAudio (`OscillatorNode`, `AudioBufferSourceNode`) and `Audio` |
 | Text | `ctx.i18n.register({ en, pl })` + `usePluginI18n` |

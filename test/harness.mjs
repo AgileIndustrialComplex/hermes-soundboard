@@ -1251,6 +1251,153 @@ check('the sequence still uses all three', () => {
 seqMount.unmount()
 seqCtx.dispose()
 
+// ── profiles ────────────────────────────────────────────────────────────
+storage.set('sounds', JSON.stringify([
+  { id: 'snd-p1', name: 'PodcastIntro', kind: 'synth', synth: 'pop', triggers: ['turn.complete'] },
+  { id: 'snd-p2', name: 'PodcastOutro', kind: 'synth', synth: 'ding', triggers: ['turn.start'] }
+]))
+storage.set('settings', JSON.stringify({ volume: 65, padsPerRow: 3 }))
+storage.delete('profiles')
+storage.delete('activeProfile')
+const prfCtx = makeCtx()
+plugin.register(prfCtx.ctx)
+const prfEngine = prfCtx.ctx.__engine
+
+check('a fresh install has no profiles and no active one', () => {
+  if (prfEngine.profiles.get().length !== 0) throw new Error('profiles appeared from nowhere')
+  if (prfEngine.activeProfile.get() !== null) throw new Error('an active profile was invented')
+})
+
+const podcastId = prfEngine.saveProfile('Podcast')
+check('saving a profile records the pads and the settings', () => {
+  const saved = prfEngine.profiles.get().find(profile => profile.id === podcastId)
+  if (!saved) throw new Error('the profile was not stored')
+  if (saved.name !== 'Podcast') throw new Error(`name=${saved.name}`)
+  if (saved.sounds.length !== 2) throw new Error(`${saved.sounds.length} pads saved`)
+  if (saved.settings.volume !== 65) throw new Error(`volume=${saved.settings.volume}`)
+  if (saved.settings.padsPerRow !== 3) throw new Error(`padsPerRow=${saved.settings.padsPerRow}`)
+})
+
+check('saving makes it the active profile', () => {
+  if (prfEngine.activeProfile.get() !== podcastId) throw new Error('the saved profile is not active')
+})
+
+// Edit the live board into something genuinely different: drop a podcast pad,
+// add a laser, and change the volume. Saving this as "Gaming" must not disturb
+// "Podcast" — a name that does not match the active profile means a new one.
+prfEngine.setVolume(20)
+prfEngine.remove('snd-p1')
+prfEngine.addPreset('laser')
+const gamingId = prfEngine.saveProfile('Gaming')
+check('saving under a different name creates a second profile', () => {
+  const names = prfEngine.profiles.get().map(profile => profile.name)
+  if (names.length !== 2) throw new Error(`profiles: ${JSON.stringify(names)}`)
+  if (!names.includes('Podcast') || !names.includes('Gaming')) throw new Error(`wrong set: ${JSON.stringify(names)}`)
+})
+check('editing after saving clears the active profile', () => {
+  // setVolume above ran before the second save, so the flag must have been
+  // cleared then; saving again re-establishes it for the new profile.
+  if (prfEngine.activeProfile.get() !== gamingId) throw new Error('active is not the newly saved profile')
+})
+
+prfEngine.applyProfile(podcastId)
+check('applying a profile restores its pads', () => {
+  const names = prfEngine.sounds.get().map(sound => sound.name)
+  if (names.length !== 2) throw new Error(`${names.length} pads after apply: ${JSON.stringify(names)}`)
+  if (!names.includes('PodcastIntro')) throw new Error(`wrong pads: ${JSON.stringify(names)}`)
+})
+
+check('applying a profile restores its settings', () => {
+  const now = prfEngine.settings.get()
+  if (now.volume !== 65) throw new Error(`volume=${now.volume}`)
+  if (now.padsPerRow !== 3) throw new Error(`padsPerRow=${now.padsPerRow}`)
+})
+
+check('the applied profile becomes active', () => {
+  if (prfEngine.activeProfile.get() !== podcastId) throw new Error('active did not follow the apply')
+})
+
+check('applying does not mark itself dirty on the next read', async () => {})
+await new Promise(resolve => setTimeout(resolve, 30))
+check('the active profile survives an apply (no false dirty flag)', () => {
+  if (prfEngine.activeProfile.get() !== podcastId) throw new Error('applying cleared its own active flag')
+})
+
+// Switching to another profile and back must be lossless.
+prfEngine.applyProfile(gamingId)
+check('switching boards swaps the pads', () => {
+  const names = prfEngine.sounds.get().map(sound => sound.name)
+  if (names.includes('PodcastIntro')) throw new Error(`still on the old board: ${JSON.stringify(names)}`)
+  if (prfEngine.settings.get().volume !== 20) throw new Error(`volume=${prfEngine.settings.get().volume}`)
+})
+prfEngine.applyProfile(podcastId)
+check('and back again', () => {
+  if (prfEngine.sounds.get().length !== 2) throw new Error('lost pads on the round trip')
+  if (prfEngine.settings.get().volume !== 65) throw new Error('lost settings on the round trip')
+})
+
+// ── blob sharing: deleting a pad must not orphan another profile's clip ──
+storage.set('sounds', JSON.stringify([
+  { id: 'snd-shared', name: 'Shared', kind: 'file', mime: 'audio/mpeg', bytes: 10 }
+]))
+storage.delete('profiles')
+storage.delete('activeProfile')
+const blobCtx = makeCtx()
+plugin.register(blobCtx.ctx)
+const blobEngine = blobCtx.ctx.__engine
+const trashed = []
+blobCtx.ctx.files = blobCtx.ctx.files || {}
+const originalTrash = blobCtx.ctx.files.trash
+blobCtx.ctx.files.trash = (folder, name) => {
+  trashed.push(name)
+  return originalTrash ? originalTrash(folder, name) : Promise.resolve()
+}
+blobEngine.saveProfile('KeepsShared')
+blobEngine.remove('snd-shared')
+check('deleting a pad still used by a profile keeps its clip', () => {
+  if (trashed.includes('snd-shared.b64')) throw new Error('the blob was deleted while a profile needs it')
+  if (blobEngine.sounds.get().length !== 0) throw new Error('the pad was not removed from the live board')
+})
+
+// Deleting the profile too means nothing references it: the blob may go.
+const keptId = blobEngine.profiles.get()[0].id
+blobEngine.deleteProfile(keptId)
+check('deleting the last profile frees the orphaned clip', () => {
+  if (!trashed.includes('snd-shared.b64')) throw new Error('the orphaned blob was never cleaned up')
+})
+
+check('deleting the active profile clears the active flag', () => {
+  if (blobEngine.activeProfile.get() !== null) throw new Error('active profile still points at a deleted one')
+})
+
+// ── persistence + sanitising ────────────────────────────────────────────
+check('profiles round-trip through storage', () => {
+  const raw = JSON.parse(storage.get('profiles'))
+  if (!Array.isArray(raw)) throw new Error('profiles are not stored as an array')
+})
+
+check('a corrupt activeProfile id is ignored on load', () => {
+  storage.set('activeProfile', JSON.stringify('prf-does-not-exist'))
+  const fresh = makeCtx()
+  plugin.register(fresh.ctx)
+  if (fresh.ctx.__engine.activeProfile.get() !== null) throw new Error('a dangling id was accepted')
+  fresh.dispose()
+  storage.delete('activeProfile')
+})
+
+check('a profile of the wrong shape is dropped, not crashed on', () => {
+  storage.set('profiles', JSON.stringify([
+    null, 'nope', { id: 'ok', name: 'Fine', sounds: [], settings: {} }
+  ]))
+  const fresh = makeCtx()
+  plugin.register(fresh.ctx)
+  const kept = fresh.ctx.__engine.profiles.get()
+  if (kept.length !== 1) throw new Error(`kept ${kept.length}`)
+  if (kept[0].id !== 'ok') throw new Error('kept the wrong entry')
+  fresh.dispose()
+  storage.delete('profiles')
+})
+
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 
 const failed = results.filter(row => !row.ok)

@@ -36,6 +36,7 @@ const ID = 'hermes-soundboard'
 const MAX_FILE_BYTES = 3 * 1024 * 1024
 const MAX_NAME_LEN = 24
 const MAX_SOUNDS = 40
+const MAX_PROFILES = 12
 const FLASH_MS = 220
 
 // ── youtube import ────────────────────────────────────────────────────────
@@ -754,6 +755,39 @@ function cleanSettings(raw) {
   }
 }
 
+/** A profile is a frozen snapshot of the working set: the pads plus the global
+ *  settings. Clips are NOT copied — they stay in the data folder under their
+ *  sound id, so two profiles can share one file. That is why deleting a pad has
+ *  to check whether any other profile still references its blob. */
+function cleanProfiles(raw) {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set()
+  const out = []
+
+  for (const entry of raw.slice(0, MAX_PROFILES)) {
+    if (!entry || typeof entry !== 'object') continue
+    const id = typeof entry.id === 'string' && entry.id.trim() ? entry.id.trim() : null
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push({
+      id,
+      name: cleanName(entry.name, 'Profile'),
+      sounds: cleanSounds(entry.sounds),
+      settings: cleanSettings(entry.settings),
+      createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now()
+    })
+  }
+
+  return out
+}
+
+/** An active-profile id is only meaningful if that profile still exists. */
+function cleanActiveId(raw, list) {
+  const id = typeof raw === 'string' ? raw.trim() : ''
+
+  return id && list.some(profile => profile.id === id) ? id : null
+}
+
 function newId() {
   const uuid = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)
 
@@ -997,6 +1031,13 @@ function createEngine(ctx) {
   const t = ctx.i18n.t
   const sounds = atom(cleanSounds(ctx.storage.get('sounds', null)))
   const settings = atom(cleanSettings(ctx.storage.get('settings', {})))
+  /** Saved snapshots of the pads + settings. The live set is what you edit;
+   *  a profile is what you restore. */
+  const profiles = atom(cleanProfiles(ctx.storage.get('profiles', null)))
+  /** Which profile the live set came from, or null for an unsaved set. Cleared
+   *  as soon as anything is edited, so the chip never claims you are on a
+   *  profile whose contents have since changed. */
+  const activeProfile = atom(cleanActiveId(ctx.storage.get('activeProfile', null), profiles.get()))
   const open = atom(false)
   const active = atom({})
   const saving = atom(false)
@@ -1012,15 +1053,21 @@ function createEngine(ctx) {
   let audioContext = null
   let disposed = false
 
+  /** True while a profile is being applied: the writes in applyProfile are not
+   *  user edits, so they must not clear the active profile that is being set. */
+  let applyingProfile = false
+
   const persistSounds = next => {
     sounds.set(next)
     ctx.storage.set('sounds', next)
+    if (!applyingProfile) leaveProfile()
   }
 
   const persistSettings = patch => {
     const next = cleanSettings({ ...settings.get(), ...patch })
     settings.set(next)
     ctx.storage.set('settings', next)
+    if (!applyingProfile) leaveProfile()
   }
 
   // One pending flash timer per pad, not per flash. Two triggers bound to the
@@ -1604,13 +1651,157 @@ function createEngine(ctx) {
     play(sound)
   }
 
+  /** True when a clip blob is still wanted by some profile. Deleting a pad in
+   *  the live set must not take the file with it if a saved profile holds the
+   *  same pad — profiles share blobs by sound id, they do not copy them. */
+  function blobInUse(soundId) {
+    if (sounds.get().some(item => item.id === soundId)) return true
+
+    return profiles.get().some(profile => profile.sounds.some(item => item.id === soundId))
+  }
+
   function remove(soundId) {
     const target = sounds.get().find(item => item.id === soundId)
     if (!target) return
     const files = ctx.files
-    if (target.kind === 'file' && files) void files.trash(files.dataFolder, `${target.id}.b64`).catch(() => {})
-    urls.delete(target.id)
+    // Remove from the live set BEFORE deciding about the blob, so the check
+    // sees the post-delete world.
     persistSounds(sounds.get().filter(item => item.id !== soundId))
+    if (target.kind === 'file' && !blobInUse(soundId) && files) {
+      void files.trash(files.dataFolder, `${target.id}.b64`).catch(() => {})
+      urls.delete(target.id)
+    }
+  }
+
+  // ── profiles ────────────────────────────────────────────────────────────
+  // A profile stores the pads and the global settings together, because they
+  // only make sense as a pair: a "podcast" profile is as much about the volume
+  // and one-at-a-time as about which clips are on the board.
+
+  const persistProfiles = next => {
+    profiles.set(next)
+    ctx.storage.set('profiles', next)
+  }
+
+  const setActive = id => {
+    activeProfile.set(id)
+    ctx.storage.set('activeProfile', id)
+  }
+
+  /** Any edit to the live set means it no longer matches the profile it came
+   *  from. Rather than diff, just forget the association — "modified" would
+   *  need a saved hash and would drift anyway. */
+  function leaveProfile() {
+    if (!activeProfile.get()) return
+    activeProfile.set(null)
+    ctx.storage.set('activeProfile', null)
+  }
+
+  const snapshot = () => ({
+    sounds: sounds.get().map(sound => ({ ...sound })),
+    settings: { ...settings.get() }
+  })
+
+  /** Save the current board under a name. Saving over the active profile is
+   *  the common case ("I tweaked my podcast board"), so it updates in place
+   *  instead of piling up near-duplicates. */
+  function saveProfile(rawName) {
+    const name = cleanName(rawName, 'Profile')
+    const active = activeProfile.get()
+    const existing = profiles.get()
+    const snapshotValue = snapshot()
+
+    // Save-in-place only when the name still matches: typing a different name
+    // means "keep this board as something else", not "rename what is open".
+    const activeEntry = existing.find(profile => profile.id === active)
+    const sameName = activeEntry && activeEntry.name.toLowerCase() === name.toLowerCase()
+
+    if (active && activeEntry && sameName) {
+      const next = existing.map(profile =>
+        profile.id === active ? { ...profile, ...snapshotValue, name } : profile
+      )
+      persistProfiles(next)
+      setActive(active)
+
+      return active
+    }
+
+    if (existing.length >= MAX_PROFILES) {
+      throw new Error(t('profilesFull'))
+    }
+
+    const profile = {
+      id: `prf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      name: uniqueName(name, existing.map(item => item.name)),
+      ...snapshotValue,
+      createdAt: Date.now()
+    }
+    persistProfiles([...existing, profile])
+    setActive(profile.id)
+
+    return profile.id
+  }
+
+  /** Switch the live board to a saved profile. The previous unsaved board is
+   *  kept as a profile named "Previous" the first time you switch away from an
+   *  unsaved set — switching is otherwise a silent way to lose work. */
+  function applyProfile(profileId) {
+    const profile = profiles.get().find(item => item.id === profileId)
+    if (!profile) return
+
+    if (!activeProfile.get() && sounds.get().length) {
+      const autoName = t('previousProfile')
+      const taken = profiles.get().map(item => item.name.toLowerCase())
+      if (!taken.includes(autoName.toLowerCase()) && profiles.get().length < MAX_PROFILES) {
+        persistProfiles([
+          ...profiles.get(),
+          {
+            id: `prf-${Date.now().toString(36)}-auto`,
+            name: autoName,
+            ...snapshot(),
+            createdAt: Date.now()
+          }
+        ])
+      }
+    }
+
+    stopVoices()
+    applyingProfile = true
+    try {
+      sounds.set(profile.sounds.map(sound => ({ ...sound })))
+      ctx.storage.set('sounds', sounds.get())
+      settings.set(cleanSettings(profile.settings))
+      ctx.storage.set('settings', settings.get())
+    } finally {
+      applyingProfile = false
+    }
+    setActive(profile.id)
+    urls.clear()
+  }
+
+  function renameProfile(profileId, rawName) {
+    const next = profiles.get().map(profile =>
+      profile.id === profileId ? { ...profile, name: cleanName(rawName, profile.name) } : profile
+    )
+    persistProfiles(next)
+  }
+
+  /** Deleting a profile drops its pads, so any clip blob only it used is now
+   *  garbage. Sweep those, and only those. */
+  function deleteProfile(profileId) {
+    const target = profiles.get().find(profile => profile.id === profileId)
+    if (!target) return
+    persistProfiles(profiles.get().filter(profile => profile.id !== profileId))
+    if (activeProfile.get() === profileId) setActive(null)
+
+    const files = ctx.files
+    if (!files) return
+    for (const sound of target.sounds) {
+      if (sound.kind !== 'file') continue
+      if (blobInUse(sound.id)) continue
+      void files.trash(files.dataFolder, `${sound.id}.b64`).catch(() => {})
+      urls.delete(sound.id)
+    }
   }
 
   /** Move a pad to a new index. Order is what the 1-9 keys address, so this is
@@ -1844,6 +2035,12 @@ function createEngine(ctx) {
     addFile,
     addPreset,
     remove,
+    profiles,
+    activeProfile,
+    saveProfile,
+    applyProfile,
+    renameProfile,
+    deleteProfile,
     rename,
     bind: toggleTrigger,
     toggleTrigger,
@@ -1879,7 +2076,7 @@ const CSS = `
 .hermes-sb-chip-label{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-panel{width:308px;max-width:calc(100vw - 24px);outline:none}
 .hermes-sb-head{display:flex;align-items:center;gap:2px;padding:0 0 6px}
-.hermes-sb-head-title{flex:1;min-width:0;padding-left:4px;font-size:10px;line-height:14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-sb-head-title{flex:0 0 auto;min-width:0;font-size:10px;line-height:14px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ui-text-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hermes-sb-iconbtn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:4px;color:var(--ui-text-tertiary);background:transparent;flex-shrink:0}
 .hermes-sb-iconbtn:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary)}
 .hermes-sb-iconbtn[data-on=true]{color:var(--ui-accent)}
@@ -2000,6 +2197,57 @@ const CSS = `
    there — so they are hidden in the popover and shown where the width exists. */
 .hermes-sb-reorder{display:none;align-items:center;gap:0;flex:0 0 auto;height:21px}
 .hermes-sb-settings-list .hermes-sb-reorder{display:flex}
+/* ── profiles ──────────────────────────────────────────────────────────
+   The switcher sits in the popover header, so it has to survive a 271px row
+   next to the title and three icon buttons: the name truncates, the caret
+   never does. */
+.hermes-sb-head-gap{flex:1 1 auto;min-width:2px}
+.hermes-sb-profile{position:relative;flex:0 1 auto;min-width:0;max-width:118px;margin-right:2px}
+.hermes-sb-profile-btn{display:flex;align-items:center;gap:3px;width:100%;height:20px;padding:0 4px;
+  border-radius:4px;font-size:10px;line-height:14px;color:var(--ui-text-secondary);
+  background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-btn:hover{border-color:var(--ui-accent);color:var(--ui-text-primary)}
+.hermes-sb-profile-btn[data-on=true]{color:var(--ui-accent);border-color:var(--ui-accent)}
+.hermes-sb-profile-btn:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
+.hermes-sb-profile-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
+.hermes-sb-profile-caret{flex:0 0 auto;font-size:8px;color:var(--ui-text-tertiary)}
+/* In flow, not absolutely positioned — the same reason as the trigger picker:
+   a 308px popover with a backdrop filter breaks fixed positioning. */
+.hermes-sb-profile-menu{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:4px;width:176px;
+  border-radius:5px;background-color:var(--ui-bg-secondary);border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-item{display:flex;align-items:center;gap:6px;width:100%;height:22px;padding:0 5px;
+  border-radius:4px;font-size:11px;text-align:left;color:var(--ui-text-primary);background:transparent}
+.hermes-sb-profile-item:hover{background-color:var(--chrome-action-hover)}
+.hermes-sb-profile-item[aria-selected=true]{color:var(--ui-accent)}
+.hermes-sb-profile-item-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hermes-sb-profile-item-meta{flex:0 0 auto;font-size:10px;color:var(--ui-text-tertiary)}
+.hermes-sb-profile-tick{flex:0 0 auto;font-size:10px;color:var(--ui-accent)}
+.hermes-sb-profile-empty{padding:4px;font-size:11px;color:var(--ui-text-tertiary)}
+.hermes-sb-profile-save{display:flex;align-items:center;gap:4px;padding-top:4px;margin-top:2px;
+  border-top:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-input{flex:1;min-width:0;height:22px;padding:0 5px;border-radius:4px;font-size:11px;
+  color:var(--ui-text-primary);background-color:var(--ui-bg-primary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-input::placeholder{color:var(--ui-text-tertiary)}
+.hermes-sb-profile-savebtn{flex:0 0 auto;height:22px;padding:0 7px;border-radius:4px;font-size:10px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-savebtn:hover{color:var(--ui-text-primary);border-color:var(--ui-accent)}
+/* Settings rows: full width, so the action leads and the count trails. */
+.hermes-sb-profile-rows{display:flex;flex-direction:column;gap:3px}
+.hermes-sb-profile-row{display:flex;align-items:center;gap:5px;height:24px}
+.hermes-sb-profile-use{flex:0 0 auto;height:21px;padding:0 7px;border-radius:4px;font-size:10px;
+  color:var(--ui-text-secondary);background-color:var(--ui-bg-tertiary);
+  border:1px solid var(--ui-stroke-secondary)}
+.hermes-sb-profile-use:hover:not(:disabled){color:var(--ui-text-primary);border-color:var(--ui-accent)}
+.hermes-sb-profile-use:disabled{color:var(--ui-accent);border-color:var(--ui-accent);cursor:default;opacity:1}
+.hermes-sb-profile-rename{flex:1;min-width:80px;height:21px;padding:0 5px;border-radius:4px;font-size:11px;
+  color:var(--ui-text-primary);background:transparent;border:1px solid transparent}
+.hermes-sb-profile-row[data-active=true] .hermes-sb-profile-rename{color:var(--ui-accent)}
+.hermes-sb-profile-rename:hover{background-color:var(--ui-bg-tertiary)}
+.hermes-sb-profile-rename:focus{background-color:var(--ui-bg-primary);border-color:var(--ui-accent);
+  outline:none}
+.hermes-sb-profile-count{flex:0 0 auto;font-size:10px;color:var(--ui-text-tertiary)}
 .hermes-sb-trim{flex:0 0 100%;display:flex;align-items:center;gap:5px;flex-wrap:wrap;
   margin:3px 0 2px;padding:5px 4px;border-radius:4px;
   background-color:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary)}
@@ -2976,6 +3224,8 @@ function Panel({ engine }) {
         className: 'hermes-sb-head',
         children: [
           jsx('span', { className: 'hermes-sb-head-title', children: t('title') }),
+          jsx(ProfilePicker, { engine }),
+          jsx('span', { className: 'hermes-sb-head-gap', 'aria-hidden': 'true' }),
           jsx(Tip, {
             label: t('stopAll'),
             children: jsx('button', {
@@ -3316,6 +3566,226 @@ function Chip({ engine }) {
   })
 }
 
+/** The profile switcher. Lives in the popover header because that is the
+ *  "on the go" surface: you change board mid-conversation, not mid-settings.
+ *  Deliberately a button + in-DOM list, same reason as the trigger picker — a
+ *  native <select> popup is drawn by the OS and cannot be styled or captured. */
+function ProfilePicker({ engine }) {
+  const t = usePluginI18n(ID)
+  const profiles = useValue(engine.profiles)
+  const activeId = useValue(engine.activeProfile)
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState('')
+  const boxRef = useRef(null)
+  const active = profiles.find(profile => profile.id === activeId)
+
+  useEffect(() => {
+    if (!open) return
+    const onDown = event => {
+      if (boxRef.current && !boxRef.current.contains(event.target)) setOpen(false)
+    }
+    const onKey = event => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey, true)
+
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey, true)
+    }
+  }, [open])
+
+  const choose = id => {
+    engine.applyProfile(id)
+    setOpen(false)
+  }
+
+  const save = () => {
+    engine.saveProfile(draft.trim() || active?.name || t('newProfile'))
+    setDraft('')
+    engine.notify({ kind: 'info', message: t('profileSaved') })
+  }
+
+  return jsxs('div', {
+    className: 'hermes-sb-profile',
+    ref: boxRef,
+    children: [
+      jsxs('button', {
+        type: 'button',
+        className: 'hermes-sb-profile-btn',
+        'aria-haspopup': 'listbox',
+        'aria-expanded': open,
+        'data-on': Boolean(active),
+        onClick: () => setOpen(value => !value),
+        children: [
+          jsx('span', { className: 'hermes-sb-profile-name', children: active ? active.name : t('noProfile') }),
+          jsx('span', { className: 'hermes-sb-profile-caret', 'aria-hidden': 'true', children: '▾' })
+        ]
+      }),
+
+      open
+        ? jsxs('div', {
+            className: 'hermes-sb-profile-menu',
+            role: 'listbox',
+            'aria-label': t('profiles'),
+            children: [
+              profiles.length
+                ? profiles.map(profile =>
+                    jsxs('button', {
+                      key: profile.id,
+                      type: 'button',
+                      role: 'option',
+                      'aria-selected': profile.id === activeId,
+                      className: 'hermes-sb-profile-item',
+                      onClick: () => choose(profile.id),
+                      children: [
+                        jsx('span', { className: 'hermes-sb-profile-item-name', children: profile.name }),
+                        jsx('span', {
+                          className: 'hermes-sb-profile-item-meta',
+                          children: t('padCount', profile.sounds.length)
+                        }),
+                        profile.id === activeId
+                          ? jsx('span', { className: 'hermes-sb-profile-tick', 'aria-hidden': 'true', children: '✓' })
+                          : null
+                      ]
+                    }, profile.id)
+                  )
+                : jsx('div', { className: 'hermes-sb-profile-empty', children: t('noProfilesYet') }),
+
+              jsxs('div', {
+                className: 'hermes-sb-profile-save',
+                children: [
+                  jsx('input', {
+                    type: 'text',
+                    className: 'hermes-sb-profile-input',
+                    placeholder: active ? t('saveOver') : t('profileName'),
+                    value: draft,
+                    'aria-label': t('profileName'),
+                    onChange: event => setDraft(event.target.value),
+                    onKeyDown: event => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        save()
+                      }
+                    }
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: 'hermes-sb-profile-savebtn',
+                    onClick: save,
+                    children: t('saveProfile')
+                  })
+                ]
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+/** Settings-page profile list: pick, rename, delete, and save the current
+ *  board. The popover switcher covers "choose on the go"; this covers editing
+ *  the set of profiles, which needs a text field per row. */
+function ProfileManager({ engine }) {
+  const t = usePluginI18n(ID)
+  const profiles = useValue(engine.profiles)
+  const activeId = useValue(engine.activeProfile)
+  const [draft, setDraft] = useState('')
+
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: '6px' },
+    children: [
+      jsx('div', { className: 'hermes-sb-profile-rows', children: profiles.length
+        ? profiles.map(profile =>
+            jsxs('div', {
+              key: profile.id,
+              className: 'hermes-sb-profile-row',
+              'data-active': profile.id === activeId,
+              children: [
+                jsx('button', {
+                  type: 'button',
+                  className: 'hermes-sb-profile-use',
+                  disabled: profile.id === activeId,
+                  'data-use': profile.id,
+                  onClick: () => engine.applyProfile(profile.id),
+                  children: profile.id === activeId ? t('activeProfile') : t('useProfile')
+                }),
+                jsx('input', {
+                  type: 'text',
+                  className: 'hermes-sb-profile-rename',
+                  defaultValue: profile.name,
+                  'aria-label': `${t('renameProfile')}: ${profile.name}`,
+                  onBlur: event => {
+                    const value = event.target.value.trim()
+                    if (value && value !== profile.name) engine.renameProfile(profile.id, value)
+                  },
+                  onKeyDown: event => {
+                    if (event.key === 'Enter') event.target.blur()
+                  }
+                }),
+                jsx('span', {
+                  className: 'hermes-sb-profile-count',
+                  children: t('padCount', profile.sounds.length)
+                }),
+                jsx('button', {
+                  type: 'button',
+                  className: 'hermes-sb-rowbtn hermes-sb-profile-delete',
+                  'data-destructive': 'true',
+                  'data-delete': profile.id,
+                  'aria-label': `${t('deleteProfile')}: ${profile.name}`,
+                  onClick: () => {
+                    engine.deleteProfile(profile.id)
+                    engine.notify({ kind: 'info', message: t('profileDeleted').replace('{name}', profile.name) })
+                  },
+                  children: jsx(icons.Trash, { size: 11 })
+                })
+              ]
+            }, profile.id)
+          )
+        : jsx('div', { className: 'hermes-sb-profile-empty', children: t('noProfilesYet') })
+      }),
+
+      jsxs('div', {
+        style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' },
+        children: [
+          jsx('input', {
+            type: 'text',
+            className: 'hermes-sb-profile-input',
+            placeholder: activeId ? t('saveOver') : t('profileName'),
+            value: draft,
+            'aria-label': t('profileName'),
+            onChange: event => setDraft(event.target.value),
+            onKeyDown: event => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                engine.saveProfile(draft.trim() || t('newProfile'))
+                setDraft('')
+              }
+            }
+          }),
+          jsx('button', {
+            type: 'button',
+            className: 'hermes-sb-settings-add',
+            'data-save-profile': 'true',
+            disabled: profiles.length >= MAX_PROFILES && !activeId,
+            onClick: () => {
+              engine.saveProfile(draft.trim() || t('newProfile'))
+              setDraft('')
+              engine.notify({ kind: 'info', message: t('profileSaved') })
+            },
+            children: activeId ? t('saveToProfile') : t('saveProfile')
+          })
+        ]
+      })
+    ]
+  })
+}
+
 /** The full pad manager, for the Settings page.
  *
  * The panel is 308px wide and shows this only while "manage" is toggled; on a
@@ -3568,6 +4038,26 @@ function SoundboardSettings({ engine }) {
           })
         ]
       }),
+      // Profiles: save the whole board (pads + volume + prefs) and switch
+      // between saved ones. Same data as the popover's switcher, but with
+      // rename and delete, which need room for a text field per row.
+      jsxs('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: '8px' },
+        children: [
+          jsx('div', {
+            style: {
+              fontSize: '11px',
+              fontWeight: 600,
+              letterSpacing: '.06em',
+              textTransform: 'uppercase',
+              color: 'var(--ui-text-tertiary)'
+            },
+            children: t('profiles')
+          }),
+          jsx(ProfileManager, { engine })
+        ]
+      }),
+
       // The pads themselves, managed here as well as in the popover. A settings
       // page is where people look for "manage my sounds"; hiding it behind a
       // toggle inside a 308px popover was the only way before.
@@ -3643,6 +4133,24 @@ const LOCALES = {
     trimFailed: 'The trim did not complete.',
     trimNeedsWindow: 'Give a start or a length — otherwise nothing would change.',
     trimOnlyFiles: 'Only imported or uploaded clips can be trimmed.',
+    profiles: 'Profiles',
+    profileName: 'New profile name',
+    saveProfile: 'Save board',
+    saveToProfile: 'Save to profile',
+    saveOver: 'Name for a new profile',
+    noProfile: 'Unsaved',
+    noProfilesYet: 'No profiles saved yet.',
+    padCount: (n) => `${n} ${n === 1 ? 'pad' : 'pads'}`,
+    activeProfile: 'Active',
+    useProfile: 'Use',
+    renameProfile: 'Rename',
+    deleteProfile: 'Delete profile',
+    profileSaved: 'Profile saved.',
+    profileDeleted: 'Deleted profile {name}.',
+    previousProfile: 'Previous board',
+    newProfile: 'Profile',
+    profilesFull: 'You have the maximum number of profiles.',
+
     moveUp: 'Move up',
     moveDown: 'Move down',
     reorderHint: 'Order sets which pad each of the 1-9 keys fires.',
@@ -3746,6 +4254,24 @@ const LOCALES = {
     trimFailed: 'Przycinanie nie powiodło się.',
     trimNeedsWindow: 'Podaj początek lub długość — inaczej nic się nie zmieni.',
     trimOnlyFiles: 'Przycinać można tylko klipy zaimportowane lub wgrane.',
+    profiles: 'Profile',
+    profileName: 'Nazwa nowego profilu',
+    saveProfile: 'Zapisz planszę',
+    saveToProfile: 'Zapisz w profilu',
+    saveOver: 'Nazwa nowego profilu',
+    noProfile: 'Niezapisana',
+    noProfilesYet: 'Nie ma jeszcze żadnych profili.',
+    padCount: (n) => `${n} ${n === 1 ? 'podkładka' : 'podkładek'}`,
+    activeProfile: 'Aktywny',
+    useProfile: 'Użyj',
+    renameProfile: 'Zmień nazwę',
+    deleteProfile: 'Usuń profil',
+    profileSaved: 'Profil zapisany.',
+    profileDeleted: 'Usunięto profil {name}.',
+    previousProfile: 'Poprzednia plansza',
+    newProfile: 'Profil',
+    profilesFull: 'Osiągnięto limit profili.',
+
     moveUp: 'W górę',
     moveDown: 'W dół',
     reorderHint: 'Kolejność decyduje, którą podkładkę uruchamia każdy z klawiszy 1-9.',
