@@ -244,7 +244,14 @@ await build({
 const THEME = `
   :root{
     --ui-bg-editor:#17130f; --ui-bg-elevated:#231d18; --ui-bg-quaternary:#2b241e;
-    --ui-bg-tertiary:#1d1814; --ui-bg-secondary:#25201b;
+    --ui-base:#efe6d8;
+    /* MIRROR THE REAL THEME. In apps/desktop/src/styles.css these are
+       color-mix(accent N%, color-mix(base M%, transparent)) — and the inner
+       'transparent' propagates, so the result is ~7-18% alpha, NOT a solid hex.
+       Hardcoding an opaque value here is how a see-through dropdown shipped
+       unnoticed: the preview looked correct while the app did not. */
+    --ui-bg-tertiary:color-mix(in srgb, var(--ui-accent) 5%, color-mix(in srgb, var(--ui-base) 5%, transparent));
+    --ui-bg-secondary:color-mix(in srgb, var(--ui-accent) 10%, color-mix(in srgb, var(--ui-base) 7%, transparent));
     --ui-text-primary:#efe6d8; --ui-text-secondary:#c3b6a4; --ui-text-tertiary:#948878;
     --ui-text-quaternary:#6f6558; --ui-accent:#dcae58; --ui-red:#e06a5b;
     --ui-stroke-secondary:#3b322a; --ui-stroke-tertiary:#2e271f;
@@ -1195,7 +1202,36 @@ const profileMenu = await page.evaluate(() => {
       const menuBox = boxOfMenu
       return field.right <= menuBox.right + 1 && btn.right <= menuBox.right + 1
     })(),
-    menuOverflows: box.right > document.querySelector('.hermes-sb-panel, [data-hermes-soundboard]')?.getBoundingClientRect().right ?? window.innerWidth
+    menuOverflows: box.right > document.querySelector('.hermes-sb-panel, [data-hermes-soundboard]')?.getBoundingClientRect().right ?? window.innerWidth,
+    menuBg: getComputedStyle(el).backgroundColor,
+    menuBackdrop: getComputedStyle(el).backdropFilter,
+    menuOpacity: getComputedStyle(el).opacity,
+    // Handle BOTH serialisations: legacy "rgba(r, g, b, a)" and the modern
+    // "color(srgb r g b / a)" that color-mix() resolves to. Parsing only the
+    // legacy form returned null for the translucent token and silenced the very
+    // assertion meant to catch it.
+    menuAlpha: (() => {
+      const bg = getComputedStyle(el).backgroundColor
+      const slash = bg.match(/\/\s*([\d.]+)\s*\)/)
+      if (slash) return parseFloat(slash[1])
+      const rgba = bg.match(/rgba\(([^)]+)\)/)
+      if (rgba) {
+        const parts = rgba[1].split(',').map(v => parseFloat(v))
+        return parts.length === 4 ? parts[3] : 1
+      }
+      if (/^(rgb|color)\(/.test(bg)) return 1
+      return null
+    })(),
+    // What actually paints behind the menu.
+    ancestorBackdrop: (() => {
+      let node = el.parentElement, out = []
+      while (node && out.length < 6) {
+        const cs = getComputedStyle(node)
+        if (cs.backdropFilter && cs.backdropFilter !== 'none') out.push(node.className || node.tagName)
+        node = node.parentElement
+      }
+      return out
+    })(),
   }
 })
 console.log(`profile menu: ${JSON.stringify(profileMenu)}`)
@@ -1220,6 +1256,9 @@ if (profileMenu.open && new Set(profileMenu.saveRowHeights).size > 1) {
 }
 if (profileMenu.open && !profileMenu.placeholderFits) {
   console.log(`!! the placeholder needs ${profileMenu.placeholderWidth}px in a ${profileMenu.saveFieldWidth}px field`)
+}
+if (profileMenu.open && profileMenu.menuAlpha !== null && profileMenu.menuAlpha < 0.999) {
+  console.log(`!! the profile menu is translucent (alpha ${profileMenu.menuAlpha}) — content shows through it`)
 }
 if (profileMenu.open && profileMenu.panelRight && profileMenu.menuRight > profileMenu.panelRight) {
   console.log(`!! the menu hangs past the panel's right edge (${profileMenu.menuRight} > ${profileMenu.panelRight})`)

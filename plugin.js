@@ -2218,9 +2218,20 @@ const CSS = `
    in-flow decision was forced by the manage list's overflow-y:auto clipping an
    absolute child; the header has no such clipping ancestor, so absolute works
    here and the board stays put. */
+/* OPAQUE. --ui-bg-secondary is NOT a solid colour in the real theme: it is
+   color-mix(accent N%, color-mix(base 7%, transparent)), and that inner
+   'transparent' propagates, leaving the composite at ~12-18% alpha. A dropdown
+   painted with it let the pad grid show straight through. --ui-bg-elevated is
+   opaque by construction (both its inputs are solid), so it is the correct base
+   for a floating surface; the shadow and border carry the separation that the
+   translucent fill used to fake. */
 .hermes-sb-profile-menu{position:absolute;top:100%;left:0;z-index:40;
   display:flex;flex-direction:column;gap:2px;margin-top:4px;padding:6px;width:184px;
-  border-radius:5px;background-color:var(--ui-bg-secondary);border:1px solid var(--ui-stroke-secondary)}
+  border-radius:5px;
+  background-color:var(--ui-bg-elevated, var(--theme-neutral-card, Canvas));
+  border:1px solid var(--ui-stroke-secondary);
+  box-shadow:0 12px 32px rgba(0,0,0,.55), 0 2px 6px rgba(0,0,0,.4),
+             0 1px 0 rgba(255,255,255,.06) inset}
 .hermes-sb-profile-item{display:flex;align-items:center;gap:6px;width:100%;height:22px;padding:0 5px;
   border-radius:4px;font-size:11px;text-align:left;color:var(--ui-text-secondary);background:transparent}
 .hermes-sb-profile-item:hover{background-color:var(--chrome-action-hover)}
