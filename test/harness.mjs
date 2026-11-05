@@ -816,6 +816,35 @@ check('duplicating a clip copies its bytes to a new pad', async () => {
   if (!files.has(`${file.id}.b64`)) throw new Error('the original clip was lost')
 })
 
+// ── monophonic mode ─────────────────────────────────────────────────────
+check('one-at-a-time defaults to off', () => {
+  const engine = boot.ctx.__engine
+  if (engine.settings.get().oneAtATime !== false) throw new Error('default is not false')
+})
+
+check('one-at-a-time persists when toggled', () => {
+  const engine = boot.ctx.__engine
+  engine.setOneAtATime(true)
+  if (engine.settings.get().oneAtATime !== true) throw new Error('not applied')
+  const saved = JSON.parse(storage.get('settings'))
+  if (saved.oneAtATime !== true) throw new Error('not persisted')
+  engine.setOneAtATime(false)
+  if (JSON.parse(storage.get('settings')).oneAtATime !== false) throw new Error('not cleared')
+})
+
+check('a corrupt settings blob falls back for the new key', () => {
+  if (typeof engine === 'undefined') return
+  // Through a reload: settings are sanitised on read.
+  storage.set('settings', JSON.stringify({ volume: 40, oneAtATime: 'yes' }))
+  const fresh = makeCtx()
+  plugin.register(fresh.ctx)
+  const e = fresh.ctx.__engine
+  if (e.settings.get().oneAtATime !== false) throw new Error('a non-boolean was accepted')
+  if (e.settings.get().volume !== 40) throw new Error('the rest of the blob was lost')
+  fresh.dispose()
+  storage.set('settings', JSON.stringify({ volume: 80, showLabel: true, padsPerRow: 4 }))
+})
+
 check('stop-all clears the active flashes', () => {
   if (pads().some(pad => pad.getAttribute('data-active') === 'true')) throw new Error('a pad is still flashing')
 })
@@ -1091,6 +1120,56 @@ check('corrupt storage falls back to the built-ins', () => {
 })
 sixthMount.unmount()
 sixth.dispose()
+
+// ── turn.start must not fire for the chained turn after one ends ────────
+// A dedicated mount with controlled bindings: earlier checks have deleted pads,
+// so the shared boot engine has nothing bound to these events.
+storage.set('sounds', JSON.stringify([
+  { id: 'snd-a', name: 'StartCue', kind: 'synth', synth: 'pop', triggers: ['turn.start'] },
+  { id: 'snd-b', name: 'DoneCue', kind: 'synth', synth: 'ding', triggers: ['turn.complete'] }
+]))
+storage.set('settings', JSON.stringify({ volume: 80 }))
+const chainSoundsBefore = storage.get('sounds')
+const chainSettingsBefore = storage.get('settings')
+const chainCtx = makeCtx()
+plugin.register(chainCtx.ctx)
+const chainEngine = chainCtx.ctx.__engine
+console.log(`chain test bindings: ${JSON.stringify(chainEngine.sounds.get().map(s => [s.name, s.triggers]))}`)
+
+const firesStart = () => {
+  const t = chainEngine.lastTrigger.get()
+  return Boolean(t && t.id === 'turn.start')
+}
+
+await emit('message.start', {})
+check('turn.start fires for a genuine send', () => {
+  const after = chainEngine.lastTrigger.get()
+  if (!after || after.id !== 'turn.start') throw new Error(`id=${after && after.id}`)
+})
+
+// A completion opens the window; the start that follows is the automatic
+// continuation. `message.start` carries no payload at the source, so this
+// time window is the only signal available.
+await emit('message.complete', { status: 'complete' })
+check('the completion itself registers', () => {
+  const t = chainEngine.lastTrigger.get()
+  if (!t || t.id !== 'turn.complete') throw new Error(`id=${t && t.id}`)
+})
+await emit('message.start', {})
+check('turn.start is SUPPRESSED for the turn right after a completion', () => {
+  if (firesStart()) throw new Error('the chained start fired turn.start')
+})
+
+// Outside the chain window, a start is a real send again.
+await new Promise(resolve => setTimeout(resolve, 1700))
+await emit('message.start', {})
+check('a send a moment later fires turn.start again', () => {
+  const after = chainEngine.lastTrigger.get()
+  if (!after || after.id !== 'turn.start') throw new Error(`id=${after && after.id}`)
+})
+chainCtx.dispose()
+if (chainSoundsBefore !== undefined) storage.set('sounds', chainSoundsBefore)
+if (chainSettingsBefore !== undefined) storage.set('settings', chainSettingsBefore)
 
 /* ── 9. report ─────────────────────────────────────────────────────────── */
 

@@ -852,6 +852,19 @@ await shot('preview-trim.png')
 await page.click('.hermes-sb-rowbtn[data-trim]')
 await page.waitForTimeout(150)
 
+// ── one-at-a-time toggle renders in settings ────────────────────────────
+await page.evaluate(() => window.__mountSettings())
+await page.waitForTimeout(300)
+const oneAtATime = await page.evaluate(() => {
+  const labels = [...document.querySelectorAll('label')]
+  const target = labels.find(l => /one sound at a time/i.test(l.textContent))
+  if (!target) return { found: false }
+  const box = target.querySelector('input[type=checkbox]')
+  return { found: true, checked: box?.checked }
+})
+console.log(`one-at-a-time setting: ${JSON.stringify(oneAtATime)}`)
+if (!oneAtATime.found) console.log('!! the one-at-a-time toggle is missing from settings')
+
 // Settings page.
 await page.evaluate(() => window.__mountSettings())
 await page.waitForTimeout(300)

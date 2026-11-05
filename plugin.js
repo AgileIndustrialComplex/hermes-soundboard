@@ -52,7 +52,9 @@ const YT_MAX_SECONDS = 30
 const YT_POLL_MS = 700
 const YT_TIMEOUT_MS = 180000
 
-const DEFAULT_SETTINGS = { volume: 80, showLabel: true, padsPerRow: 4 }
+// `oneAtATime` is the monophonic mode: starting a sound stops whatever is still
+// playing, so overlapping clips never stack.
+const DEFAULT_SETTINGS = { volume: 80, showLabel: true, padsPerRow: 4, oneAtATime: false }
 
 // ── synths ────────────────────────────────────────────────────────────────
 // Short, distinct, gesture-free cues. Every one is a few oscillator/noise
@@ -257,8 +259,15 @@ const TRIGGERS = [
     event: 'message.start',
     group: 'Turn',
     label: 'Turn starts',
-    detail: 'you hit send',
-    when: payload => payload?.display_kind !== 'auto_continue'
+    detail: 'you send a message — not the turn after one ends',
+    // `display_kind` CANNOT be used here. The gateway's emitters call
+    // `_emit("message.start", sid)` with no payload at all, so the field is
+    // always undefined and a filter on it is dead code (the same turn echoed
+    // straight after `message.complete` looked exactly like a fresh send).
+    // Instead the engine tracks whether a turn just ended: a `message.start`
+    // within CHAIN_WINDOW_MS of a completion is the chained follow-up, not you.
+    when: (payload, event, engine) =>
+      payload?.display_kind !== 'auto_continue' && !engine?.isChainedStart?.(event)
   },
   {
     id: 'attention.approval',
@@ -736,7 +745,8 @@ function cleanSettings(raw) {
   return {
     volume: Number.isFinite(volume) ? Math.max(0, Math.min(100, Math.round(volume))) : DEFAULT_SETTINGS.volume,
     showLabel: typeof source.showLabel === 'boolean' ? source.showLabel : DEFAULT_SETTINGS.showLabel,
-    padsPerRow: [3, 4, 5].includes(source.padsPerRow) ? source.padsPerRow : DEFAULT_SETTINGS.padsPerRow
+    padsPerRow: [3, 4, 5].includes(source.padsPerRow) ? source.padsPerRow : DEFAULT_SETTINGS.padsPerRow,
+    oneAtATime: typeof source.oneAtATime === 'boolean' ? source.oneAtATime : DEFAULT_SETTINGS.oneAtATime
   }
 }
 
@@ -834,6 +844,17 @@ function createEngine(ctx) {
   // and whichever expires first clears the flag the second one just set — so the
   // pad goes dark early, or an assertion right after the second fire sees
   // nothing at all.
+  /** When the last turn COMPLETED — used to tell a chained follow-up turn apart
+   *  from the user pressing send. `message.start` carries no payload, so the
+   *  gateway gives no other signal: a start arriving within this window of a
+   *  completion is the automatic continuation, not a user action. */
+  let lastCompleteAt = 0
+  const CHAIN_WINDOW_MS = 1500
+
+  function isChainedStart() {
+    return Date.now() - lastCompleteAt < CHAIN_WINDOW_MS
+  }
+
   /** Master volume × this pad's own trim, clamped to something playable. */
   function gainFor(sound) {
     const master = settings.get().volume / 100
@@ -941,6 +962,10 @@ function createEngine(ctx) {
 
   function play(sound) {
     if (disposed || !sound) return
+    // Monophonic mode: a new pad cuts whatever is still sounding, so two clips
+    // never overlap. `stopAll` also suspends the context, which would mute the
+    // sound we are about to start — so only the players are stopped here.
+    if (settings.get().oneAtATime) stopVoices()
     flash(sound.id)
     const gain = gainFor(sound)
     if (sound.kind === 'synth') playSynth(sound.synth, gain)
@@ -965,12 +990,18 @@ function createEngine(ctx) {
     let payload = null
     try {
       payload = event?.payload ?? null
-      if (!trigger.when(payload, event)) return
+      if (!trigger.when(payload, event, { isChainedStart })) return
     } catch {
       // A malformed payload must never take the event stream down.
       return
     }
+    // A completion opens the chained-follow-up window; the start that follows it
+    // is the automatic continuation rather than a send.
+    if (trigger.event === 'message.complete') lastCompleteAt = Date.now()
     lastTrigger.set({ id: triggerId, at: Date.now() })
+    // A triggered cue is monophonic under the same setting: whatever else is
+    // still sounding stops before this one starts.
+    if (settings.get().oneAtATime) stopVoices()
     let fired = 0
     for (const sound of bound()) {
       if (!sound.triggers.includes(triggerId)) continue
@@ -1279,6 +1310,21 @@ function createEngine(ctx) {
     }
   }
 
+  /** Stop every sounding voice but keep the AudioContext alive. */
+  function stopVoices() {
+    for (const audio of playing) {
+      audio.pause()
+      audio.currentTime = 0
+      audio.src = ''
+    }
+    playing.clear()
+    for (const timer of timers.values()) clearTimeout(timer)
+    timers.clear()
+    // A cut pad must not stay lit: the flash flag is visual state for a sound
+    // that is no longer playing.
+    active.set({})
+  }
+
   function stopAll() {
     for (const audio of playing) {
       audio.pause()
@@ -1446,7 +1492,8 @@ function createEngine(ctx) {
     restorePresets,
     setVolume: volume => persistSettings({ volume }),
     setShowLabel: showLabel => persistSettings({ showLabel }),
-    setPadsPerRow: padsPerRow => persistSettings({ padsPerRow })
+    setPadsPerRow: padsPerRow => persistSettings({ padsPerRow }),
+    setOneAtATime: oneAtATime => persistSettings({ oneAtATime })
   }
 }
 
@@ -2578,6 +2625,24 @@ function SoundboardSettings({ engine }) {
           jsx('span', { children: t('showLabel') })
         ]
       }),
+      jsxs('label', {
+        style: { display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '12px', color: 'var(--ui-text-secondary)' },
+        children: [
+          jsx('input', {
+            type: 'checkbox',
+            checked: settings.oneAtATime,
+            style: { marginTop: '2px' },
+            onChange: event => engine.setOneAtATime(event.target.checked)
+          }),
+          jsxs('span', {
+            style: { display: 'flex', flexDirection: 'column', gap: '2px' },
+            children: [
+              jsx('span', { children: t('oneAtATime') }),
+              jsx('span', { style: { fontSize: '11px', color: 'var(--ui-text-tertiary)' }, children: t('oneAtATimeHint') })
+            ]
+          })
+        ]
+      }),
       jsxs('div', {
         style: { fontSize: '12px', color: 'var(--ui-text-tertiary)' },
         children: [
@@ -2649,6 +2714,8 @@ const LOCALES = {
     whenClear: 'Clear all triggers',
     lastTrigger: trigger => `Last trigger: ${trigger}`,
     showLabel: 'Show the Soundboard label in the status bar',
+    oneAtATime: 'Play one sound at a time',
+    oneAtATimeHint: 'A new pad stops whatever is still playing, so clips never overlap.',
     empty: 'No sounds yet. Add an audio file, or drop one here.',
     restore: 'Restore built-in sounds',
     builtins: 'Built-in sounds',

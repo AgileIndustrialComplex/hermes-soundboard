@@ -51,6 +51,10 @@ mode all persist per machine.
   context compaction, a heartbeat, a wake phrase, or affection detected in your
   message. Bound pads carry a dot in the grid; the panel footer names the last
   trigger that actually fired. See [Triggers](#triggers).
+- **One at a time.** An optional *Play one sound at a time* mode stops whatever
+  is still sounding before the next pad starts, so clips never stack — useful if
+  you fire pads quickly and the overlap turns to mush. Applies to clicks and to
+  triggered cues alike.
 - **Volume + mute.** One master volume, persisted. `■` stops everything and
   suspends the audio context. Each pad also has its own **gain trim** (0-200%,
   stepped with −/+) for the one clip that is still too loud or quiet — the
@@ -141,7 +145,7 @@ on load, and unknown or duplicate ids are dropped.
 | Turn | Turn finishes | `message.complete` | status is not `error` / `interrupted` |
 | Turn | Turn fails | `message.complete` | status `error`, or `error` is set |
 | Turn | Turn interrupted | `message.complete` | status `interrupted` |
-| Turn | Turn starts | `message.start` | you sent a message (not an auto-continue) |
+| Turn | Turn starts | `message.start` | you send a message — **not** the turn chained after one ends |
 | Attention | Approval needed | `approval.request` | the agent is blocked on approval |
 | Attention | Question asked | `clarify.request` | the agent is blocked on a question |
 | Attention | Warning notice | `notification.show` | level `warn` or `error` |
@@ -186,6 +190,13 @@ That lesson is now enforced by the harness: the stub popover mirrors the real
 one's `backdrop-filter`, and the suite asserts the menu is inside the panel box
 and at least 200px wide. Both assertions were verified to fail on a
 deliberately reverted build.
+
+**On "Turn starts" after a turn ends.** `message.start` carries **no payload**
+from the gateway (`_emit("message.start", sid)`), so `display_kind` is always
+undefined there and a filter on it is dead code — the automatic follow-up turn
+was indistinguishable from you pressing send. The engine instead remembers when
+the last turn completed: a start arriving within 1.5s of a completion is the
+chained continuation and does not fire. A genuine send a moment later does.
 
 **On playback failures.** `playFile` used to swallow everything: the pad
 flashed, nothing was audible, and no message appeared — indistinguishable from
